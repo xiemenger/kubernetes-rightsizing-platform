@@ -1,0 +1,66 @@
+# Weekly scheduled rightsizing analysis (production design).
+# Runs every Tuesday morning; creates a Job that executes the same pipeline as
+# app/tasks/pipeline.py (collectors → RightsizerEngine → PostgreSQL).
+#
+# Demo manifest — replace image, secrets, and command with your registry and config.
+
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: weekly-rightsizing
+  namespace: rightsizing
+  labels:
+    app: right-sizing
+    component: scheduled-analysis
+spec:
+  # Every Tuesday at 08:00 UTC
+  schedule: "0 8 * * 2"
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      backoffLimit: 2
+      template:
+        metadata:
+          labels:
+            app: right-sizing
+            component: analysis-job
+        spec:
+          restartPolicy: OnFailure
+          containers:
+            - name: rightsizing-analysis
+              # Set by CI/CD: right-sizing:<git-sha>
+              image: right-sizing:REPLACE_ME
+              imagePullPolicy: IfNotPresent
+              command:
+                - python
+                - -c
+                # Placeholder — production would invoke pipeline entrypoint or Celery task runner
+                - |
+                  print("Run rightsizing pipeline: collectors → engine → persist")
+              env:
+                - name: DATABASE_URL
+                  valueFrom:
+                    secretKeyRef:
+                      name: rightsizing-secrets
+                      key: database-url
+                - name: REDIS_URL
+                  valueFrom:
+                    secretKeyRef:
+                      name: rightsizing-secrets
+                      key: redis-url
+                - name: PROMETHEUS_URL
+                  value: "http://prometheus.monitoring.svc:9090"
+                - name: CLOUDABILITY_API_KEY
+                  valueFrom:
+                    secretKeyRef:
+                      name: rightsizing-secrets
+                      key: cloudability-api-key
+              resources:
+                requests:
+                  cpu: "500m"
+                  memory: "512Mi"
+                limits:
+                  cpu: "2"
+                  memory: "2Gi"

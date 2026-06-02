@@ -1,0 +1,288 @@
+# Multi-cluster rightsizing CI/CD pipeline (demo)
+#
+# test        — unit + integration tests (in-memory SQLite; no Docker/PostgreSQL)
+# build       — Docker image packaging
+# smoke_test  — quick image sanity check
+# Per-cluster chain (deploy → verify → trigger) for GitLab UI visibility:
+#   dev:  deploy_dev → verify_dev → trigger_weekly_dev
+#   sit:  deploy_sit → verify_sit → trigger_weekly_sit  (after all dev stages pass)
+#   prd:  deploy_prd → verify_prd → trigger_weekly_prd  (after all sit stages pass)
+#
+# Future enhancements: linting, security scanning, registry push, dynamic child
+# pipelines generated from deploy/clusters.yaml for 50+ production clusters.
+
+stages:
+  - test
+  - build
+  - smoke_test
+  - deploy_dev
+  - verify_dev
+  - trigger_weekly_dev
+  - deploy_sit
+  - verify_sit
+  - trigger_weekly_sit
+  - deploy_prd
+  - verify_prd
+  - trigger_weekly_prd
+
+variables:
+  PIP_CACHE_DIR: "$CI_PROJECT_DIR/.cache/pip"
+  FLASK_ENV: testing
+  SQLALCHEMY_DATABASE_URI: "sqlite:///:memory:"
+  IMAGE_NAME: "right-sizing"
+
+cache:
+  key: "${CI_COMMIT_REF_SLUG}-pip"
+  paths:
+    - .cache/pip
+
+# =============================================================================
+# test
+# =============================================================================
+pytest:
+  stage: test
+  image: python:3.9
+  before_script:
+    - pip install --upgrade pip
+    - pip install -r requirements.txt
+  script:
+    - pytest -v
+
+# =============================================================================
+# build
+# =============================================================================
+build-image:
+  stage: build
+  image: docker:24
+  services:
+    - docker:24-dind
+  variables:
+    DOCKER_TLS_CERTDIR: "/certs"
+  before_script:
+    - docker info
+  script:
+    - docker build -t "${IMAGE_NAME}:${CI_COMMIT_SHA}" .
+    - docker image inspect "${IMAGE_NAME}:${CI_COMMIT_SHA}"
+
+# =============================================================================
+# smoke_test — validate container starts (no external DB required)
+# =============================================================================
+smoke-test-image:
+  stage: smoke_test
+  image: docker:24
+  services:
+    - docker:24-dind
+  variables:
+    DOCKER_TLS_CERTDIR: "/certs"
+  needs:
+    - build-image
+  script:
+    - docker run --rm "${IMAGE_NAME}:${CI_COMMIT_SHA}" python -c "import app; print('smoke test OK')"
+
+# =============================================================================
+# Shared templates for cluster operations (demo — no real kubeconfig)
+# =============================================================================
+.cluster_script_base:
+  image: alpine:3.19
+  before_script:
+    - apk add --no-cache bash
+    - chmod +x scripts/*.sh
+  needs:
+    - build-image
+    - smoke-test-image
+
+.deploy_dev_base:
+  extends: .cluster_script_base
+  stage: deploy_dev
+
+.verify_dev_base:
+  extends: .cluster_script_base
+  stage: verify_dev
+
+.deploy_sit_base:
+  extends: .cluster_script_base
+  stage: deploy_sit
+
+.verify_sit_base:
+  extends: .cluster_script_base
+  stage: verify_sit
+
+.deploy_prd_base:
+  extends: .cluster_script_base
+  stage: deploy_prd
+
+.verify_prd_base:
+  extends: .cluster_script_base
+  stage: verify_prd
+
+# Trigger jobs depend only on the matching verify job in the same cluster chain.
+.trigger_script_base:
+  image: alpine:3.19
+  before_script:
+    - apk add --no-cache bash
+    - chmod +x scripts/*.sh
+
+.trigger_weekly_dev_base:
+  extends: .trigger_script_base
+  stage: trigger_weekly_dev
+
+.trigger_weekly_sit_base:
+  extends: .trigger_script_base
+  stage: trigger_weekly_sit
+
+.trigger_weekly_prd_base:
+  extends: .trigger_script_base
+  stage: trigger_weekly_prd
+
+# =============================================================================
+# deploy_dev — one GitLab job per cluster for pipeline visibility
+# =============================================================================
+deploy_dev_us_east_1:
+  extends: .deploy_dev_base
+  script:
+    - ./scripts/deploy_to_cluster.sh dev-us-east-1 dev rightsizing dev-us-east-1 "${CI_COMMIT_SHA}"
+
+deploy_dev_us_west_2:
+  extends: .deploy_dev_base
+  script:
+    - ./scripts/deploy_to_cluster.sh dev-us-west-2 dev rightsizing dev-us-west-2 "${CI_COMMIT_SHA}"
+
+# =============================================================================
+# verify_dev
+# =============================================================================
+verify_dev_us_east_1:
+  extends: .verify_dev_base
+  needs:
+    - job: deploy_dev_us_east_1
+    - job: build-image
+    - job: smoke-test-image
+  script:
+    - ./scripts/verify_cluster.sh dev-us-east-1 rightsizing dev-us-east-1
+
+verify_dev_us_west_2:
+  extends: .verify_dev_base
+  needs:
+    - job: deploy_dev_us_west_2
+    - job: build-image
+    - job: smoke-test-image
+  script:
+    - ./scripts/verify_cluster.sh dev-us-west-2 rightsizing dev-us-west-2
+
+# =============================================================================
+# deploy_sit — runs only after verify_dev stage succeeds
+# =============================================================================
+deploy_sit_us_east_1:
+  extends: .deploy_sit_base
+  script:
+    - ./scripts/deploy_to_cluster.sh sit-us-east-1 sit rightsizing sit-us-east-1 "${CI_COMMIT_SHA}"
+
+deploy_sit_us_west_2:
+  extends: .deploy_sit_base
+  script:
+    - ./scripts/deploy_to_cluster.sh sit-us-west-2 sit rightsizing sit-us-west-2 "${CI_COMMIT_SHA}"
+
+# =============================================================================
+# verify_sit
+# =============================================================================
+verify_sit_us_east_1:
+  extends: .verify_sit_base
+  needs:
+    - job: deploy_sit_us_east_1
+    - job: build-image
+    - job: smoke-test-image
+  script:
+    - ./scripts/verify_cluster.sh sit-us-east-1 rightsizing sit-us-east-1
+
+verify_sit_us_west_2:
+  extends: .verify_sit_base
+  needs:
+    - job: deploy_sit_us_west_2
+    - job: build-image
+    - job: smoke-test-image
+  script:
+    - ./scripts/verify_cluster.sh sit-us-west-2 rightsizing sit-us-west-2
+
+# =============================================================================
+# deploy_prd — runs only after verify_sit stage succeeds
+# =============================================================================
+deploy_prd_us_east_1:
+  extends: .deploy_prd_base
+  script:
+    - ./scripts/deploy_to_cluster.sh prd-us-east-1 prd rightsizing prd-us-east-1 "${CI_COMMIT_SHA}"
+
+deploy_prd_us_west_2:
+  extends: .deploy_prd_base
+  script:
+    - ./scripts/deploy_to_cluster.sh prd-us-west-2 prd rightsizing prd-us-west-2 "${CI_COMMIT_SHA}"
+
+# =============================================================================
+# verify_prd
+# =============================================================================
+verify_prd_us_east_1:
+  extends: .verify_prd_base
+  needs:
+    - job: deploy_prd_us_east_1
+    - job: build-image
+    - job: smoke-test-image
+  script:
+    - ./scripts/verify_cluster.sh prd-us-east-1 rightsizing prd-us-east-1
+
+verify_prd_us_west_2:
+  extends: .verify_prd_base
+  needs:
+    - job: deploy_prd_us_west_2
+    - job: build-image
+    - job: smoke-test-image
+  script:
+    - ./scripts/verify_cluster.sh prd-us-west-2 rightsizing prd-us-west-2
+
+# =============================================================================
+# trigger_weekly_dev — each job depends only on its cluster verify_dev job
+# =============================================================================
+trigger_weekly_dev_us_east_1:
+  extends: .trigger_weekly_dev_base
+  needs:
+    - job: verify_dev_us_east_1
+  script:
+    - ./scripts/trigger_weekly_job.sh dev-us-east-1 rightsizing dev-us-east-1
+
+trigger_weekly_dev_us_west_2:
+  extends: .trigger_weekly_dev_base
+  needs:
+    - job: verify_dev_us_west_2
+  script:
+    - ./scripts/trigger_weekly_job.sh dev-us-west-2 rightsizing dev-us-west-2
+
+# =============================================================================
+# trigger_weekly_sit — each job depends only on its cluster verify_sit job
+# =============================================================================
+trigger_weekly_sit_us_east_1:
+  extends: .trigger_weekly_sit_base
+  needs:
+    - job: verify_sit_us_east_1
+  script:
+    - ./scripts/trigger_weekly_job.sh sit-us-east-1 rightsizing sit-us-east-1
+
+trigger_weekly_sit_us_west_2:
+  extends: .trigger_weekly_sit_base
+  needs:
+    - job: verify_sit_us_west_2
+  script:
+    - ./scripts/trigger_weekly_job.sh sit-us-west-2 rightsizing sit-us-west-2
+
+# =============================================================================
+# trigger_weekly_prd — each job depends only on its cluster verify_prd job
+# =============================================================================
+trigger_weekly_prd_us_east_1:
+  extends: .trigger_weekly_prd_base
+  needs:
+    - job: verify_prd_us_east_1
+  script:
+    - ./scripts/trigger_weekly_job.sh prd-us-east-1 rightsizing prd-us-east-1
+
+trigger_weekly_prd_us_west_2:
+  extends: .trigger_weekly_prd_base
+  needs:
+    - job: verify_prd_us_west_2
+  script:
+    - ./scripts/trigger_weekly_job.sh prd-us-west-2 rightsizing prd-us-west-2

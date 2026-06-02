@@ -1,0 +1,75 @@
+version: "3.9"
+###
+# ┌─────────────┐
+# │    web      │
+# │ Flask API   │
+# └──────┬──────┘
+#        │
+#        ▼
+# ┌─────────────┐
+# │   redis     │
+# │ Task Queue  │
+# └──────┬──────┘
+#        │
+#        ▼
+# ┌─────────────┐
+# │   worker    │
+# │   Celery    │
+# └──────┬──────┘
+#        │
+#        ▼
+# ┌─────────────┐
+# │     db      │
+# │ PostgreSQL  │
+# └─────────────┘
+###
+services:
+  web:
+    build: .
+    command: flask run --host=0.0.0.0 --port=5000
+    ports:
+      - "5000:5000"
+    environment:
+      - DATABASE_URL=postgresql://user:pass@db:5432/rightsizer
+      - REDIS_URL=redis://redis:6379/0
+      - FLASK_APP=app:create_app
+      - FLASK_DEBUG=1
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_started
+
+  worker:
+    build: .
+    command: celery -A app.tasks.pipeline.celery_app worker --loglevel=info --concurrency=2
+    environment:
+      - DATABASE_URL=postgresql://user:pass@db:5432/rightsizer
+      - REDIS_URL=redis://redis:6379/0
+      - FLASK_APP=app:create_app
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_started
+
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: user
+      POSTGRES_PASSWORD: pass
+      POSTGRES_DB: rightsizer
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: [ "CMD-SHELL", "pg_isready -U user -d rightsizer" ]
+      interval: 5s
+      retries: 5
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+
+volumes:
+  pgdata:

@@ -1,0 +1,562 @@
+# Kubernetes Rightsizing Recommendation Platform — Architecture Design
+
+> Technical architecture reference for the demo implementation and production design targets.  
+> Aligned with [README.md](README.md). Stack: Python · Flask · Celery · PostgreSQL · Redis · Docker Compose · GitLab CI.
+
+**Demo vs production:** Collectors, Celery execution, and `MockEmailSender` are implemented for local/demo use. Real APIs, in-cluster workers, SES/SMTP delivery, and `kubectl`-based deploys are documented as production extensions.
+
+---
+
+## 1. Project Folder Structure
+
+```
+right_sizing/
+├── app/
+│   ├── __init__.py                 # Flask app factory
+│   ├── api/
+│   │   ├── health.py               # GET /api/v1/health
+│   │   ├── jobs.py                 # POST/GET /api/v1/jobs
+│   │   └── recommendations.py      # GET /api/v1/recommendations
+│   ├── collectors/                 # K8s, Prometheus, Cloudability, AWS pricing (mock)
+│   ├── engine/
+│   │   └── rightsizer.py           # RightsizerEngine, RecommendationConfig
+│   ├── reports/                    # Report generator + notification
+│   │   ├── report_generator.py
+│   │   └── email_sender.py         # MockEmailSender
+│   ├── models/
+│   │   └── schema.py               # Job, Recommendation ORM
+│   ├── tasks/
+│   │   └── pipeline.py             # Celery run_rightsizing_job
+│   └── config.py
+├── tests/
+│   ├── unit/                       # Engine, report, email
+│   └── integration/                # Recommendations API
+├── deploy/
+│   ├── clusters.yaml               # Multi-cluster inventory
+│   └── k8s/cronjob.yaml            # Weekly Tuesday CronJob (production design)
+├── scripts/                        # deploy, verify, trigger_weekly
+├── .gitlab-ci.yml
+├── docker-compose.yml
+└── README.md
+```
+
+**Key principle:** collectors, engine, persistence, API, reports, and notifications are decoupled — each layer can be swapped or mocked independently (Clean Architecture).
+
+---
+
+## 2. Main Modules
+
+### `collectors/` — Data ingestion
+
+Demo collectors return typed dataclasses; production implementations replace the mock classes while keeping the same interfaces.
+
+| Collector | Output type | Data |
+|-----------|-------------|------|
+| `MockKubernetesCollector` | `ServiceSpecification` | `cpu_request_cores`, `mem_request_mib` per service |
+| `MockPrometheusCollector` | `ServiceMetrics` | `cpu_p95_cores`, `mem_p95_mib` (P95 over rolling window) |
+| `MockCloudabilityCollector` | `ServiceCostInfo` | `weekly_cost_usd` (optional — never fabricated when missing) |
+| `MockAwsPricingCollector` | `AwsResourcePricing` | Normalized `cpu_cost_per_core_hour`, `mem_cost_per_mib_hour` |
+
+Correlation key: `(cluster, namespace, service_name)`.
+
+### `engine/rightsizer.py` — Recommendation logic
+
+Pure domain layer: no Flask, SQLAlchemy, or network I/O.
+
+```python
+class RightsizerEngine:
+    def __init__(self, config: RecommendationConfig): ...
+
+    def generate_recommendations(
+        self,
+        specifications: List[ServiceSpecification],
+        metrics: List[ServiceMetrics],
+        costs: List[ServiceCostInfo],
+        pricing: Optional[AwsResourcePricing] = None,
+    ) -> List[Recommendation]:
+        ...
+```
+
+See **§3 Recommendation Logic** for policy details.
+
+### `reports/` — Report generator and notification
+
+| Module | Responsibility |
+|--------|----------------|
+| `report_generator.py` | `ReportRow`, `ReportSummary`, `generate_report_summary()` from ORM rows |
+| `email_sender.py` | `format_report_email_body()`, `MockEmailSender` (records messages in demo) |
+
+**Status:** Modules are implemented. The Celery task persists recommendations only; report + email are invoked after job completion (production worker or operator automation). Not auto-wired in `pipeline.py` yet.
+
+### `tasks/pipeline.py` — Celery orchestration
+
+`run_rightsizing_job(job_id)` runs inside Flask app context: update job status → collectors → engine → bulk persist → `completed` / `failed`.
+
+### `app/__init__.py` — Flask factory
+
+Registers blueprints: health, jobs, recommendations. Initializes SQLAlchemy.
+
+---
+
+## 3. Recommendation Logic
+
+Recommendations are **P95-based**, not average-based and **not** based on fixed over-provisioning ratios (no 3× CPU / 2× memory heuristics).
+
+### P95 usage model
+
+- Prometheus supplies **P95 CPU and memory** over a rolling observation window (e.g. 7 days).
+- Recommended request = `P95 × (1 + headroom%)`, floored at configurable minimums.
+- Current Kubernetes **requests** are compared to recommendations for savings estimation.
+
+### Aggressive vs conservative policies
+
+Configured via **`RecommendationConfig`** (dependency-injected into `RightsizerEngine`):
+
+| Policy | Default headroom | Intent |
+|--------|------------------|--------|
+| **Aggressive** | 20% | Lower target requests → higher potential savings |
+| **Conservative** | 50% | Higher headroom → more spike tolerance |
+
+Default floors: `min_cpu_cores = 0.1`, `min_memory_mib = 128`.
+
+Both policies are computed in **one engine pass** per service:
+
+- `aggressive_cpu_cores` / `conservative_cpu_cores`
+- `aggressive_mem_mib` / `conservative_mem_mib`
+- `aggressive_estimated_weekly_savings_usd` / `conservative_estimated_weekly_savings_usd`
+
+### Cost and savings estimation
+
+| Field | Meaning |
+|-------|---------|
+| `weekly_cost_usd` | **Actual** Cloudability weekly spend when present; `None` when missing (never invented) |
+| `cost_status` | `"actual"` or `"missing"` |
+| `savings_estimation_source` | `"cloudability"` \| `"aws_node_pricing"` \| `"unavailable"` |
+
+**Resolution order (`_resolve_savings_context`):**
+
+1. **Cloudability actual cost** — preferred; `cost_status = actual`, savings based on observed spend.
+2. **AWS normalized node pricing fallback** — when Cloudability cost is missing but `AwsResourcePricing` is provided; derives a synthetic weekly cost from current CPU/memory requests × hourly rates × 168 hours. Used **only** for savings math, not stored as actual spend.
+3. **Unavailable** — no pricing context; savings fields are `None`.
+
+Savings estimate (`_estimate_savings`): proportional reduction from current requests to recommended CPU/memory (50% CPU weight + 50% memory weight) applied to the resolved base cost.
+
+**Over- vs under-provisioned:** Lower recommendations than current requests → positive savings; higher recommendations → negative savings (cost increase signal).
+
+---
+
+## 4. Database Schema
+
+### `jobs` — Async job lifecycle
+
+```sql
+CREATE TABLE jobs (
+    id          UUID PRIMARY KEY,
+    status      VARCHAR(20) NOT NULL DEFAULT 'pending',
+                -- pending | running | completed | failed
+    created_at  TIMESTAMPTZ NOT NULL,
+    updated_at  TIMESTAMPTZ NOT NULL,
+    error       TEXT
+);
+```
+
+Authoritative source for job state (durable if Redis/Celery messages are lost).
+
+### `recommendations` — One row per service per job run
+
+```sql
+CREATE TABLE recommendations (
+    id              UUID PRIMARY KEY,
+    job_id          UUID NOT NULL REFERENCES jobs(id) ON DELETE CASCADE,
+
+    cluster         VARCHAR(255) NOT NULL,
+    namespace       VARCHAR(255) NOT NULL,
+    pod             VARCHAR(255) NOT NULL,
+    container       VARCHAR(255) NOT NULL,
+
+    -- Current state
+    cpu_request_cores     NUMERIC(10,4),
+    mem_request_mib         NUMERIC(10,2),
+    cpu_p95_cores           NUMERIC(10,4),
+    mem_p95_mib             NUMERIC(10,2),
+
+    -- Aggressive vs conservative targets
+    aggressive_cpu_cores        NUMERIC(10,4),
+    conservative_cpu_cores      NUMERIC(10,4),
+    aggressive_mem_mib          NUMERIC(10,2),
+    conservative_mem_mib        NUMERIC(10,2),
+
+    -- Cost (actual Cloudability only when present)
+    weekly_cost_usd                         NUMERIC(10,4),
+    cost_status                             VARCHAR(20) NOT NULL DEFAULT 'missing',
+    savings_estimation_source               VARCHAR(30) NOT NULL DEFAULT 'unavailable',
+
+    aggressive_estimated_weekly_savings_usd   NUMERIC(10,4),
+    conservative_estimated_weekly_savings_usd NUMERIC(10,4),
+
+    created_at      TIMESTAMPTZ NOT NULL
+);
+
+CREATE INDEX idx_recommendations_job_id ON recommendations(job_id);
+CREATE INDEX idx_recommendations_namespace ON recommendations(namespace);
+```
+
+**Legacy columns** (`rec_cpu_request_cores`, `rec_mem_request_mib`, `estimated_weekly_savings_usd`, `savings_pct`) remain nullable in ORM for backward compatibility; API and reports use aggressive/conservative fields.
+
+**Design notes:**
+
+- Immutable rows per job run — full audit trail, no in-place updates.
+- `pod` stores engine `service_name` in the demo pipeline.
+- Query latest results by `job_id`; API sorts by `aggressive_estimated_weekly_savings_usd` DESC.
+
+### Entity relationship
+
+```
+┌─────────────┐
+│    jobs     │
+│ id (PK)     │
+│ status      │
+│ timestamps  │
+│ error       │
+└──────┬──────┘
+       │ 1:N
+       ▼
+┌──────────────────────────────────────────────┐
+│           recommendations                  │
+│ job_id (FK)                                │
+│ cluster, namespace, pod, container         │
+│ current requests + P95                     │
+│ aggressive_* / conservative_* targets    │
+│ weekly_cost_usd, cost_status, source       │
+│ aggressive/conservative savings USD      │
+└──────────────────────────────────────────────┘
+```
+
+---
+
+## 5. API Endpoints
+
+| Method | Path | Purpose |
+|--------|------|---------|
+| `GET` | `/api/v1/health` | Liveness |
+| `POST` | `/api/v1/jobs` | Create job, enqueue Celery task → **202** |
+| `GET` | `/api/v1/jobs/<job_id>` | Poll status |
+| `GET` | `/api/v1/recommendations` | List recommendations for a job |
+
+### `GET /api/v1/recommendations`
+
+| Query param | Required | Description |
+|-------------|----------|-------------|
+| `job_id` | Yes | UUID |
+| `namespace` | No | Filter |
+| `min_aggressive_savings` | No | Minimum aggressive weekly savings (USD) |
+| `page` | No | Default `1` |
+| `page_size` | No | Default `50`, max `200` |
+
+**Sort:** `aggressive_estimated_weekly_savings_usd` descending.
+
+**Response shape:** `job_id`, `page`, `page_size`, `total_count`, `count`, `recommendations[]` (each via `to_dict()`).
+
+---
+
+## 6. Celery Workflow
+
+```
+HTTP POST /api/v1/jobs
+        │
+        ▼
+Flask: Job(status=pending) → db.commit()
+        │
+        ▼
+run_rightsizing_job.delay(job_id)  →  Redis broker
+        │
+        ▼ (Celery worker)
+Job(status=running)
+        │
+        ├─ MockKubernetesCollector.collect_services()
+        ├─ MockPrometheusCollector.collect_metrics(services)
+        ├─ MockCloudabilityCollector.collect_costs(services)
+        ├─ MockAwsPricingCollector.get_pricing(region)
+        │
+        ├─ RightsizerEngine(RecommendationConfig.defaults())
+        │     .generate_recommendations(...)
+        │
+        ├─ Persist Recommendation rows → PostgreSQL
+        │
+        └─ Job(status=completed | failed)
+        │
+        ▼ (post-completion — demo: explicit call; production: worker hook)
+generate_report_summary(job_id, recommendations)
+        │
+        ▼
+MockEmailSender.send_report(recipients, summary)
+        │
+        ▼
+Recipient → GET /api/v1/recommendations?job_id=...
+```
+
+**Configuration:**
+
+- Broker / backend: Redis (`REDIS_URL`)
+- `task_acks_late=True`, `worker_prefetch_multiplier=1`
+- `max_retries=3` on `run_rightsizing_job`
+
+**Production alternatives:** SQS/RabbitMQ broker; Kubernetes Job instead of Celery worker; wire report send inside worker after commit.
+
+---
+
+## 7. Data Flow
+
+### Linear pipeline (collection → persistence)
+
+```
+Kubernetes    Prometheus    Cloudability    AWS Pricing
+      │             │              │               │
+      └─────────────┴──────────────┴───────────────┘
+                          │
+                          ▼
+                    Collectors
+                          │
+                          ▼
+                  RightsizerEngine
+                          │
+                          ▼
+                    PostgreSQL
+```
+
+### Post-persistence branches
+
+```
+                    PostgreSQL
+                    /        \
+                   /          \
+                  ▼            ▼
+      Recommendations API    Report Generator
+      (GET /api/v1/            (generate_report_summary)
+       recommendations)              │
+                                     ▼
+                            Notification Service
+                            (MockEmailSender / future SES)
+                                     │
+                                     ▼
+                              Email Recipient
+                                     │
+                                     ▼
+                         Detailed data via API or report_url
+```
+
+### Request path (manual trigger)
+
+```
+Client / CI
+    │ POST /api/v1/jobs
+    ▼
+Flask API ──enqueue──► Redis ──dequeue──► Celery Worker
+    │                                              │
+    │ insert Job                                   │ collectors → engine
+    ▼                                              ▼
+PostgreSQL ◄──────────────────────────── bulk insert recommendations
+    │
+    ├──► Flask GET recommendations (polling / dashboards)
+    └──► Report + email (after job completed)
+```
+
+---
+
+## 8. Reporting and Notification
+
+```
+PostgreSQL (recommendations)
+        ↓
+Report Generator — ReportRow / ReportSummary, sorted by aggressive savings DESC
+        ↓
+Notification Service — plain-text table + summary totals + report_url
+        ↓
+Email Recipient
+        ↓
+GET /api/v1/recommendations (full detail, filters, pagination)
+```
+
+| Email section | Content |
+|---------------|---------|
+| Header | Job ID, total recommendations, total aggressive estimated savings |
+| Table | Namespace, service, current/recommended CPU & memory, estimated savings |
+| Footer | `report_url` → detailed recommendations |
+
+**Demo:** `MockEmailSender` appends to `sent_messages`.  
+**Production:** AWS SES, SMTP, SendGrid, or internal notification platform.
+
+---
+
+## 9. Deployment Architecture
+
+GitLab CI/CD orchestrates build, validation, per-environment rollout, and simulated weekly job triggers.
+
+```
+GitLab CI (.gitlab-ci.yml)
+        │
+        ▼
+      test          ← pytest (SQLite in CI)
+        │
+        ▼
+      build         ← Docker image
+        │
+        ▼
+   smoke_test       ← container import sanity check
+        │
+        ├──────────────────────────────────────┐
+        ▼                                      ▼
+   deploy_dev → verify_dev → trigger_weekly_dev
+        │ (per cluster in deploy/clusters.yaml)
+        ▼
+   deploy_sit → verify_sit → trigger_weekly_sit
+        │
+        ▼
+   deploy_prd → verify_prd → trigger_weekly_prd
+        │
+        ▼
+Kubernetes CronJob (production)
+   deploy/k8s/cronjob.yaml — Tuesday 08:00 UTC
+        │
+        ▼
+Same analysis pipeline as Celery task
+```
+
+| Artifact | Role |
+|----------|------|
+| `.gitlab-ci.yml` | Stage definitions, per-cluster job templates, `needs` dependencies |
+| `deploy/clusters.yaml` | Cluster inventory (name, env, namespace, kube_context) |
+| `scripts/deploy_to_cluster.sh` | Deploy hook (demo echo; commented `kubectl` for production) |
+| `scripts/verify_cluster.sh` | Post-deploy verification |
+| `scripts/trigger_weekly_job.sh` | Simulates weekly CronJob POST/trigger after verify |
+
+See **§10 Multi-Cluster Deployment** for cluster-level job layout.
+
+---
+
+## 10. Multi-Cluster Deployment
+
+**Inventory:** `deploy/clusters.yaml` lists clusters by environment:
+
+| Environment | Demo clusters |
+|-------------|---------------|
+| `dev` | `dev-us-east-1`, `dev-us-west-2` |
+| `sit` | `sit-us-east-1`, `sit-us-west-2` |
+| `prd` | `prd-us-east-1`, `prd-us-west-2` |
+
+### One GitLab job per cluster
+
+Each cluster has its own **deploy → verify → trigger_weekly** chain so the GitLab UI shows **per-cluster success or failure** (e.g. `deploy_dev_us_east_1`, `verify_dev_us_east_1`, `trigger_weekly_dev_us_east_1`).
+
+`trigger_weekly_*` jobs depend only on the matching `verify_*` job for that cluster—not on all clusters in another region.
+
+### Environment promotion
+
+```
+dev (all cluster jobs)  →  sit  →  prd
+```
+
+Sit stages run after dev pipeline completes; prd after sit. Mirrors progressive rollout in production.
+
+### Scale: 50+ clusters
+
+Production often has **50+ clusters** across regions and accounts. This demo uses six static jobs. At scale, teams typically:
+
+- Generate **dynamic child pipelines** from `deploy/clusters.yaml` (GitLab `trigger` + matrix or YAML-driven job generation), or
+- Partition by env/region with separate pipeline includes.
+
+Future improvement documented in README §10.
+
+---
+
+## 11. Testing Strategy
+
+### Unit tests (`tests/unit/`)
+
+| File | Focus |
+|------|--------|
+| `test_rightsizer.py` | P95 headroom, aggressive vs conservative, Cloudability vs AWS fallback, over/under-provisioned, custom config |
+| `test_report_generator.py` | `generate_report_summary`, sorting, totals |
+| `test_email_sender.py` | Plain-text body, `MockEmailSender` |
+
+Engine tests use **no database and no network** — highest coverage, fastest feedback.
+
+### Integration tests (`tests/integration/`)
+
+- Flask **test client** + **SQLite in-memory** (`tests/conftest.py`)
+- Blueprints: health, jobs, recommendations
+- `test_recommendations_api.py` — filters, `min_aggressive_savings`, sort, pagination, validation
+
+**All 22 pytest tests pass.** CI runs `pytest -v` in the `test` stage with `SQLALCHEMY_DATABASE_URI=sqlite:///:memory:`.
+
+### Principles
+
+- Business logic in engine and report formatters — unit tested
+- API tests validate HTTP contract and query behavior
+- Collectors tested implicitly via pipeline/engine inputs (mock data shape is stable dataclasses)
+
+---
+
+## 12. Docker Compose Services
+
+| Service | Role |
+|---------|------|
+| `web` | Flask API on port 5000 |
+| `worker` | Celery worker (`app.tasks.pipeline`) |
+| `db` | PostgreSQL 16 |
+| `redis` | Celery broker and result backend |
+
+Startup: `docker compose up --build`
+
+---
+
+## 13. Design Tradeoffs
+
+### Async Celery jobs vs synchronous API
+
+**Chose:** POST returns 202; worker runs multi-source collection and engine.  
+**Why:** Production analysis can take minutes; job table enables retry and audit.  
+**Tradeoff:** Requires broker, worker, and polling.
+
+### Immutable recommendation rows
+
+**Chose:** Insert-only per job run.  
+**Why:** History, simple worker, clear “latest” semantics via `job_id`.  
+**Tradeoff:** Growth over time — archival/TTL in production.
+
+### Pure RightsizerEngine
+
+**Chose:** No I/O inside engine.  
+**Why:** Trivial unit tests; side effects in Celery and API layers.  
+**Tradeoff:** `pipeline.py` owns orchestration and mapping to ORM.
+
+### Report/email outside Celery task (demo)
+
+**Chose:** Separate `app/reports` modules, manual or future hook after commit.  
+**Why:** Clear separation of analysis vs delivery; easy to test email format.  
+**Tradeoff:** Production should invoke send in worker or event handler to avoid missed notifications.
+
+### Redis broker + PostgreSQL job state
+
+**Chose:** Redis for queue; PostgreSQL for authoritative job/recommendation data.  
+**Why:** Simple demo setup.  
+**Tradeoff:** Redis restart can drop queued tasks; job row remains recoverable for status.
+
+---
+
+## 14. Future Production Extensions
+
+| Concern | Demo | Production |
+|---------|------|------------|
+| Collectors | Mock dataclasses | Real Prometheus, K8s API, Cloudability, AWS Pricing API |
+| Scheduling | Manual POST + CI `trigger_weekly_*` | `deploy/k8s/cronjob.yaml` per cluster |
+| Email | `MockEmailSender` | SES, SMTP, SendGrid |
+| UI | Recommendations API only | Frontend linked from `report_url` |
+| CI deploy | Shell echo | Real `kubectl` with per-cluster kubeconfig |
+| Multi-cluster | 6 static GitLab jobs | Dynamic child pipelines from `clusters.yaml` |
+| Metrics | P95 only | P99, multi-window (7d/14d/30d), confidence scores |
+| Autoscaling | — | HPA min/max recommendations |
+
+---
+
+*Architecture document scoped for technical review and interview walkthrough. For quick start and API examples, see [README.md](README.md).*

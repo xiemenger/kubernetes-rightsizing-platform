@@ -1,0 +1,44 @@
+# Cluster inventory for multi-environment rightsizing deployment.
+# File: deploy/clusters.yaml (inventory source for CI and future dynamic pipelines)
+#
+# Each cluster has its own deploy → verify → trigger chain in GitLab CI so operators
+# can see per-cluster success or failure in the pipeline UI.
+#
+# Production environments may contain 50+ clusters across regions and accounts.
+# At scale, teams typically:
+#   - generate child pipelines from this inventory (GitLab `trigger` + matrix), or
+#   - partition clusters by env/region with dynamic job generation from YAML.
+
+clusters:
+  dev:
+    - name: dev-us-east-1
+      env: dev
+      namespace: rightsizing
+      kube_context: dev-us-east-1
+
+    - name: dev-us-west-2
+      env: dev
+      namespace: rightsizing
+      kube_context: dev-us-west-2
+
+  sit:
+    - name: sit-us-east-1
+      env: sit
+      namespace: rightsizing
+      kube_context: sit-us-east-1
+
+    - name: sit-us-west-2
+      env: sit
+      namespace: rightsizing
+      kube_context: sit-us-west-2
+
+  prd:
+    - name: prd-us-east-1
+      env: prd
+      namespace: rightsizing
+      kube_context: prd-us-east-1
+
+    - name: prd-us-west-2
+      env: prd
+      namespace: rightsizing
+      kube_context: prd-us-west-2
