@@ -7,13 +7,17 @@ from app.models.schema import Recommendation
 
 @dataclass(frozen=True)
 class ReportRow:
-    """One service line in the weekly rightsizing report."""
+    """One workload line in the weekly rightsizing report."""
     namespace: str
-    service_name: str
+    workload_name: str
     current_cpu_request_cores: Optional[float]
+    cpu_p95_cores: Optional[float]
     aggressive_cpu_cores: Optional[float]
+    conservative_cpu_cores: Optional[float]
     current_mem_request_mib: Optional[float]
+    mem_p95_mib: Optional[float]
     aggressive_mem_mib: Optional[float]
+    conservative_mem_mib: Optional[float]
     aggressive_estimated_weekly_savings_usd: Optional[float]
 
 
@@ -37,11 +41,15 @@ def recommendation_to_report_row(rec: Recommendation) -> ReportRow:
     """Map a persisted Recommendation ORM record to a report table row."""
     return ReportRow(
         namespace=rec.namespace,
-        service_name=rec.pod,
+        workload_name=rec.workload_name,
         current_cpu_request_cores=_to_float(rec.cpu_request_cores),
+        cpu_p95_cores=_to_float(rec.cpu_p95_cores),
         aggressive_cpu_cores=_to_float(rec.aggressive_cpu_cores),
+        conservative_cpu_cores=_to_float(rec.conservative_cpu_cores),
         current_mem_request_mib=_to_float(rec.mem_request_mib),
+        mem_p95_mib=_to_float(rec.mem_p95_mib),
         aggressive_mem_mib=_to_float(rec.aggressive_mem_mib),
+        conservative_mem_mib=_to_float(rec.conservative_mem_mib),
         aggressive_estimated_weekly_savings_usd=_to_float(
             rec.aggressive_estimated_weekly_savings_usd
         ),

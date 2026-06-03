@@ -44,12 +44,13 @@ class Job(db.Model):
             "error": self.error,
         }
 
-class Recommendation(db.Model): 
-    # 某个 container 的 recommendation result
-    # one job => many recommendations
-    # 2026-05-28 运行了一次 recommendation job 123
-    # 产出了 3 条 recommendation 记录
-    # 它们共享相同的 job_id=123
+class Recommendation(db.Model):
+    """
+    One rightsizing recommendation for a logical Kubernetes workload in a namespace.
+
+    This demo uses workload-level granularity (e.g. Deployment name). Production
+    systems may persist container-level rows if finer granularity is required.
+    """
 
     __tablename__ = "recommendations"
 
@@ -58,8 +59,8 @@ class Recommendation(db.Model):
 
     cluster = db.Column(db.String(255), nullable=False)
     namespace = db.Column(db.String(255), nullable=False, index=True)
-    pod = db.Column(db.String(255), nullable=False)
-    container = db.Column(db.String(255), nullable=False)
+    workload_name = db.Column(db.String(255), nullable=False)
+    workload_type = db.Column(db.String(50), nullable=True, default="Deployment")
 
     # Current state — cpu unit: core, memory unit: mebibyte
     cpu_request_cores = db.Column(db.Numeric(10, 4), nullable=True)
@@ -97,8 +98,8 @@ class Recommendation(db.Model):
             "job_id": str(self.job_id),
             "cluster": self.cluster,
             "namespace": self.namespace,
-            "pod": self.pod,
-            "container": self.container,
+            "workload_name": self.workload_name,
+            "workload_type": self.workload_type,
             "cpu_request_cores": float(self.cpu_request_cores) if self.cpu_request_cores is not None else None,
             "mem_request_mib": float(self.mem_request_mib) if self.mem_request_mib is not None else None,
             "cpu_p95_cores": float(self.cpu_p95_cores) if self.cpu_p95_cores is not None else None,

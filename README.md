@@ -195,7 +195,7 @@ Rows are sorted by **aggressive estimated savings descending** (highest impact f
 Example columns:
 
 ```
-Namespace | Service | Current CPU | Recommended CPU | Current Memory | Recommended Memory | Estimated Savings
+Namespace | Workload | CPU Req | CPU P95 | Agg CPU | Cons CPU | Mem Req | Mem P95 | Agg Mem | Cons Mem | Savings
 ```
 
 ### Implementation status

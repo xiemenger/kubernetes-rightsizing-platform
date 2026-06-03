@@ -48,7 +48,8 @@ def make_recommendation(
     job_id: uuid.UUID,
     *,  # 后面的参数必须使用关键字参数(keyword argument)， 不能使用位置参数(positional argument)， def func(a, *, b, c):func(1, b=2, c=3)
     namespace: str = "payments",
-    pod: str = "checkout-api",
+    workload_name: str = "checkout-api",
+    workload_type: str = "Deployment",
     aggressive_estimated_weekly_savings_usd: float = 100.0,
     **overrides, # 接收任意数量的额外 keyword arguments，并放到一个 dict ， 例如func(**kwargs):
 ) -> Recommendation:
@@ -57,8 +58,8 @@ def make_recommendation(
         "job_id": job_id,
         "cluster": "prod-us-east",
         "namespace": namespace,
-        "pod": pod,
-        "container": pod,
+        "workload_name": workload_name,
+        "workload_type": workload_type,
         "cpu_request_cores": 2.0,
         "mem_request_mib": 2048.0,
         "cpu_p95_cores": 1.0,
@@ -82,8 +83,8 @@ def sample_recommendations(app, sample_job):
     """Two recommendation rows attached to sample_job."""
     with app.app_context():
         rows = [
-            make_recommendation(sample_job.id, pod="checkout-api"),
-            make_recommendation(sample_job.id, pod="billing-api", namespace="payments"),
+            make_recommendation(sample_job.id, workload_name="checkout-api"),
+            make_recommendation(sample_job.id, workload_name="billing-api", namespace="payments"),
         ]
         db.session.add_all(rows)
         db.session.commit()

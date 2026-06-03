@@ -195,8 +195,8 @@ CREATE TABLE recommendations (
 
     cluster         VARCHAR(255) NOT NULL,
     namespace       VARCHAR(255) NOT NULL,
-    pod             VARCHAR(255) NOT NULL,
-    container       VARCHAR(255) NOT NULL,
+    workload_name   VARCHAR(255) NOT NULL,
+    workload_type   VARCHAR(50),
 
     -- Current state
     cpu_request_cores     NUMERIC(10,4),
@@ -230,7 +230,7 @@ CREATE INDEX idx_recommendations_namespace ON recommendations(namespace);
 **Design notes:**
 
 - Immutable rows per job run — full audit trail, no in-place updates.
-- `pod` stores engine `service_name` in the demo pipeline.
+- `workload_name` stores engine `service_name`; `workload_type` defaults to `Deployment` in the demo pipeline.
 - Query latest results by `job_id`; API sorts by `aggressive_estimated_weekly_savings_usd` DESC.
 
 ### Entity relationship
@@ -248,7 +248,7 @@ CREATE INDEX idx_recommendations_namespace ON recommendations(namespace);
 ┌──────────────────────────────────────────────┐
 │           recommendations                  │
 │ job_id (FK)                                │
-│ cluster, namespace, pod, container         │
+│ cluster, namespace, workload_name, workload_type │
 │ current requests + P95                     │
 │ aggressive_* / conservative_* targets    │
 │ weekly_cost_usd, cost_status, source       │

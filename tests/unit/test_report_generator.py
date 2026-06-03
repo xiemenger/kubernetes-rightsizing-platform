@@ -13,27 +13,31 @@ def _make_recommendation(
     job_id: uuid.UUID,
     *,
     namespace: str,
-    service_name: str,
+    workload_name: str,
     cpu_request: float = 2.0,
+    cpu_p95: float = 1.0,
     aggressive_cpu: float = 1.2,
+    conservative_cpu: float = 1.5,
     mem_request: float = 2048.0,
+    mem_p95: float = 1024.0,
     aggressive_mem: float = 1228.8,
+    conservative_mem: float = 1536.0,
     savings: Optional[float] = 50.0,
 ) -> Recommendation:
     return Recommendation(
         job_id=job_id,
         cluster="prod-us-east",
         namespace=namespace,
-        pod=service_name,
-        container=service_name,
+        workload_name=workload_name,
+        workload_type="Deployment",
         cpu_request_cores=cpu_request,
         mem_request_mib=mem_request,
-        cpu_p95_cores=1.0,
-        mem_p95_mib=1024.0,
+        cpu_p95_cores=cpu_p95,
+        mem_p95_mib=mem_p95,
         aggressive_cpu_cores=aggressive_cpu,
-        conservative_cpu_cores=1.5,
+        conservative_cpu_cores=conservative_cpu,
         aggressive_mem_mib=aggressive_mem,
-        conservative_mem_mib=1536.0,
+        conservative_mem_mib=conservative_mem,
         weekly_cost_usd=100.0,
         cost_status="actual",
         savings_estimation_source="cloudability",
@@ -47,17 +51,21 @@ def _make_recommendation(
 class TestRecommendationToReportRow:
     def test_maps_orm_fields_to_report_row(self):
         job_id = uuid.uuid4()
-        rec = _make_recommendation(job_id, namespace="payments", service_name="checkout-api")
+        rec = _make_recommendation(job_id, namespace="payments", workload_name="checkout-api")
 
         row = recommendation_to_report_row(rec)
 
         assert row == ReportRow(
             namespace="payments",
-            service_name="checkout-api",
+            workload_name="checkout-api",
             current_cpu_request_cores=2.0,
+            cpu_p95_cores=1.0,
             aggressive_cpu_cores=1.2,
+            conservative_cpu_cores=1.5,
             current_mem_request_mib=2048.0,
+            mem_p95_mib=1024.0,
             aggressive_mem_mib=1228.8,
+            conservative_mem_mib=1536.0,
             aggressive_estimated_weekly_savings_usd=50.0,
         )
 
@@ -66,9 +74,9 @@ class TestGenerateReportSummary:
     def test_builds_summary_sorted_by_savings_descending(self):
         job_id = uuid.uuid4()
         recommendations = [
-            _make_recommendation(job_id, namespace="a", service_name="low", savings=25.0),
-            _make_recommendation(job_id, namespace="b", service_name="high", savings=200.0),
-            _make_recommendation(job_id, namespace="c", service_name="mid", savings=100.0),
+            _make_recommendation(job_id, namespace="a", workload_name="low", savings=25.0),
+            _make_recommendation(job_id, namespace="b", workload_name="high", savings=200.0),
+            _make_recommendation(job_id, namespace="c", workload_name="mid", savings=100.0),
         ]
 
         summary = generate_report_summary(
@@ -81,7 +89,7 @@ class TestGenerateReportSummary:
         assert summary.total_recommendations == 3
         assert summary.total_aggressive_estimated_savings_usd == 325.0
         assert summary.report_url == f"https://app.example.com/reports?job_id={job_id}"
-        assert [row.service_name for row in summary.report_rows] == [
+        assert [row.workload_name for row in summary.report_rows] == [
             "high",
             "mid",
             "low",
@@ -93,13 +101,13 @@ class TestGenerateReportSummary:
             _make_recommendation(
                 job_id,
                 namespace="ns-a",
-                service_name="with-savings",
+                workload_name="with-savings",
                 savings=50.0,
             ),
             _make_recommendation(
                 job_id,
                 namespace="ns-b",
-                service_name="no-savings",
+                workload_name="no-savings",
                 savings=None,
             ),
         ]
@@ -107,6 +115,6 @@ class TestGenerateReportSummary:
         summary = generate_report_summary(job_id, recommendations)
 
         assert summary.total_aggressive_estimated_savings_usd == 50.0
-        assert summary.report_rows[0].service_name == "with-savings"
-        assert summary.report_rows[-1].service_name == "no-savings"
+        assert summary.report_rows[0].workload_name == "with-savings"
+        assert summary.report_rows[-1].workload_name == "no-savings"
         assert summary.report_rows[-1].aggressive_estimated_weekly_savings_usd is None

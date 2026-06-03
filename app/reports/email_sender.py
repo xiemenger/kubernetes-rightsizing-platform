@@ -13,18 +13,25 @@ def _format_cell(value, width: int) -> str:
     return text[:width].ljust(width)
 
 
+# Compact column headers for plain-text email (request → P95 → aggressive/conservative recs).
+REPORT_TABLE_HEADERS = [
+    ("Namespace", 12),
+    ("Workload", 14),
+    ("CPU Req", 7),
+    ("CPU P95", 7),
+    ("Agg CPU", 7),
+    ("Cons CPU", 8),
+    ("Mem Req", 8),
+    ("Mem P95", 8),
+    ("Agg Mem", 8),
+    ("Cons Mem", 8),
+    ("Savings", 8),
+]
+
+
 def format_report_email_body(summary: ReportSummary) -> str:
     """Build a plain-text weekly rightsizing report email body with a data table."""
-    headers = [
-        ("Namespace", 14),
-        ("Service", 18),
-        ("Current CPU", 12),
-        ("Recommended CPU", 16),
-        ("Current Memory", 15),
-        ("Recommended Memory", 19),
-        ("Estimated Savings", 18),
-    ]
-
+    headers = REPORT_TABLE_HEADERS
     header_line = " | ".join(name.ljust(width) for name, width in headers)
     separator = "-+-".join("-" * width for _, width in headers)
 
@@ -55,11 +62,15 @@ def format_report_email_body(summary: ReportSummary) -> str:
 def _format_report_row_line(row: ReportRow, headers) -> str:
     values = [
         row.namespace,
-        row.service_name,
+        row.workload_name,
         row.current_cpu_request_cores,
+        row.cpu_p95_cores,
         row.aggressive_cpu_cores,
+        row.conservative_cpu_cores,
         row.current_mem_request_mib,
+        row.mem_p95_mib,
         row.aggressive_mem_mib,
+        row.conservative_mem_mib,
         row.aggressive_estimated_weekly_savings_usd,
     ]
     cells = [

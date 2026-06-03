@@ -42,12 +42,12 @@ class TestNamespaceFilter:
                     make_recommendation(
                         sample_job.id,
                         namespace="payments",
-                        pod="checkout-api",
+                        workload_name="checkout-api",
                     ),
                     make_recommendation(
                         sample_job.id,
                         namespace="frontend",
-                        pod="web-ui",
+                        workload_name="web-ui",
                     ),
                 ]
             )
@@ -70,12 +70,12 @@ class TestMinAggressiveSavingsFilter:
                 [
                     make_recommendation(
                         sample_job.id,
-                        pod="service-a",
+                        workload_name="service-a",
                         aggressive_estimated_weekly_savings_usd=50.0,
                     ),
                     make_recommendation(
                         sample_job.id,
-                        pod="service-b",
+                        workload_name="service-b",
                         aggressive_estimated_weekly_savings_usd=200.0,
                     ),
                 ]
@@ -89,7 +89,7 @@ class TestMinAggressiveSavingsFilter:
         assert response.status_code == 200
         body = response.get_json()
         assert body["count"] == 1
-        assert body["recommendations"][0]["pod"] == "service-b"
+        assert body["recommendations"][0]["workload_name"] == "service-b"
         assert body["recommendations"][0]["aggressive_estimated_weekly_savings_usd"] == 200.0
 
 
@@ -100,17 +100,17 @@ class TestDefaultSorting:
                 [
                     make_recommendation(
                         sample_job.id,
-                        pod="low",
+                        workload_name="low",
                         aggressive_estimated_weekly_savings_usd=50.0,
                     ),
                     make_recommendation(
                         sample_job.id,
-                        pod="high",
+                        workload_name="high",
                         aggressive_estimated_weekly_savings_usd=200.0,
                     ),
                     make_recommendation(
                         sample_job.id,
-                        pod="mid",
+                        workload_name="mid",
                         aggressive_estimated_weekly_savings_usd=100.0,
                     ),
                 ]
@@ -133,7 +133,7 @@ class TestPagination:
             rows = [
                 make_recommendation(
                     sample_job.id,
-                    pod=f"service-{index}",
+                    workload_name=f"service-{index}",
                     aggressive_estimated_weekly_savings_usd=float(index),
                 )
                 for index in range(25)
