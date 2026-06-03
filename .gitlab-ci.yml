@@ -7,11 +7,16 @@
 #    Validates code, builds the Docker image, smoke-tests the container,
 #    and simulates deploy + verification to dev clusters (no real kubeconfig).
 #
-# 2) Optional manual CronJob trigger (not the production scheduler)
-#    schedule_job → schedule_weekly_rightsizing (RUN_WEEKLY_RIGHTSIZER=true only)
-#    Runs scripts/trigger_weekly_job.sh to create a one-off K8s Job from the CronJob.
-#    Production weekly runs use deploy/k8s/cronjob.yaml:
-#      python -m app.scheduler.cluster_run
+# 2) Weekly rightsizing scheduler (GitLab Pipeline Schedule — primary)
+#    schedule_job → schedule_weekly_rightsizing
+#    GitLab Schedule decides WHEN the run occurs (audit history, manual runs).
+#    This job uses kubectl to create a Kubernetes Job — Python does NOT run on
+#    the GitLab runner. Execution happens in-cluster:
+#      Pod → python -m app.scheduler.cluster_run → Celery batches → PostgreSQL
+#
+# Configure a Pipeline Schedule in GitLab (e.g. Tuesday 08:00 UTC) targeting
+# this project. The schedule_weekly_rightsizing job runs when
+# CI_PIPELINE_SOURCE=schedule (or RUN_WEEKLY_RIGHTSIZER=true for manual testing).
 
 stages:
   - test
@@ -124,17 +129,26 @@ verify_dev_us_west_2:
     - ./scripts/verify_cluster.sh dev-us-west-2 rightsizing dev-us-west-2
 
 # =============================================================================
-# schedule_job — optional manual CronJob trigger (not production runtime)
+# schedule_job — primary weekly scheduler (GitLab Pipeline Schedule)
 # =============================================================================
-schedule_weekly_rightsizing:
+.schedule_weekly_base:
   stage: schedule_job
   image: alpine:3.19
   before_script:
     - apk add --no-cache bash
     - chmod +x scripts/*.sh
   rules:
+    # Intended trigger: GitLab → CI/CD → Schedules → Pipeline Schedule
+    - if: '$CI_PIPELINE_SOURCE == "schedule"'
+    # Manual / operator testing without waiting for the schedule
     - if: '$RUN_WEEKLY_RIGHTSIZER == "true"'
     - when: never
+
+schedule_weekly_rightsizing:
+  extends: .schedule_weekly_base
+  needs:
+    - build-image
   script:
-    - ./scripts/trigger_weekly_job.sh dev-us-east-1 rightsizing dev-us-east-1
-    - ./scripts/trigger_weekly_job.sh dev-us-west-2 rightsizing dev-us-west-2
+    # kubectl create Job from deploy/k8s/job-template.yaml — no Python on runner
+    - ./scripts/trigger_weekly_job.sh dev-us-east-1 rightsizing dev-us-east-1 "${CI_COMMIT_SHA}"
+    - ./scripts/trigger_weekly_job.sh dev-us-west-2 rightsizing dev-us-west-2 "${CI_COMMIT_SHA}"

@@ -1,0 +1,73 @@
+# Weekly rightsizing execution — Kubernetes Job template.
+# GitLab Pipeline Schedule triggers schedule_weekly_rightsizing, which creates
+# a one-off Job from this manifest (unique name per run, e.g. rightsizing-<timestamp>).
+#
+# The Job Pod is not long-running. It runs:
+#   python -m app.scheduler.cluster_run
+# which enqueues namespace-batch Celery tasks and exits successfully.
+# Use Job (not Deployment/CronJob) because scheduling is owned by GitLab.
+#
+# Demo manifest — replace image, secrets, and env with your registry and config.
+
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: rightsizing-REPLACE_ME
+  namespace: rightsizing
+  labels:
+    app: right-sizing
+    component: scheduled-analysis
+spec:
+  # Completed Jobs are removed automatically after 24 hours.
+  ttlSecondsAfterFinished: 86400
+  backoffLimit: 2
+  template:
+    metadata:
+      labels:
+        app: right-sizing
+        component: analysis-job
+    spec:
+      restartPolicy: OnFailure
+      containers:
+        - name: rightsizing-analysis
+          # Set by CI/CD: right-sizing:<git-sha>
+          image: right-sizing:REPLACE_ME
+          imagePullPolicy: IfNotPresent
+          command:
+            - python
+            - -m
+            - app.scheduler.cluster_run
+          env:
+            - name: CLUSTER_NAME
+              value: "prod-us-east-1"
+            # Optional — omit or leave unset to use scheduler defaults
+            - name: NAMESPACE_BLACKLIST
+              value: "kube-system"
+            - name: BATCH_SIZE
+              value: "50"
+            # - name: NAMESPACE_WHITELIST
+            #   value: "payments,checkout,catalog"
+            - name: DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: rightsizing-secrets
+                  key: database-url
+            - name: REDIS_URL
+              valueFrom:
+                secretKeyRef:
+                  name: rightsizing-secrets
+                  key: redis-url
+            - name: PROMETHEUS_URL
+              value: "http://prometheus.monitoring.svc:9090"
+            - name: CLOUDABILITY_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: rightsizing-secrets
+                  key: cloudability-api-key
+          resources:
+            requests:
+              cpu: "500m"
+              memory: "512Mi"
+            limits:
+              cpu: "2"
+              memory: "2Gi"

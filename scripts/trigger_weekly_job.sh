@@ -1,44 +1,49 @@
 #!/usr/bin/env bash
-# Manually create a one-off Kubernetes Job from the weekly-rightsizing CronJob template.
+# Create a one-off Kubernetes Job for weekly rightsizing execution.
 #
-# This script does NOT call the Flask API. Rightsizing execution runs inside the
-# Job container via:
-#   python -m app.scheduler.cluster_run
-#
-# GitLab CI (optional): schedule_weekly_rightsizing may invoke this script to
-# trigger the CronJob template in a cluster for operator testing — the Python
-# scheduler entrypoint still runs in Kubernetes, not in the GitLab runner.
+# Primary trigger: GitLab Pipeline Schedule → schedule_weekly_rightsizing
+# (see .gitlab-ci.yml). This script does NOT run Python on the GitLab runner;
+# the Job Pod runs: python -m app.scheduler.cluster_run
 #
 # Usage:
-#   ./scripts/trigger_weekly_job.sh <cluster_name> <namespace> <kube_context>
+#   ./scripts/trigger_weekly_job.sh <cluster_name> <namespace> <kube_context> [image_tag]
 
 set -euo pipefail
 
 CLUSTER_NAME="${1:?cluster_name required}"
 NAMESPACE="${2:?namespace required}"
 KUBE_CONTEXT="${3:?kube_context required}"
+IMAGE_TAG="${4:-REPLACE_ME}"
 
-CRONJOB_NAME="weekly-rightsizing"
+JOB_NAME="rightsizing-$(date +%s)"
+TEMPLATE="${CI_PROJECT_DIR:-.}/deploy/k8s/job-template.yaml"
+RENDERED="/tmp/${JOB_NAME}.yaml"
 
-echo "=== Manual trigger: weekly-rightsizing CronJob ==="
+echo "=== Weekly rightsizing: create Kubernetes Job ==="
 echo "cluster:      ${CLUSTER_NAME}"
 echo "namespace:    ${NAMESPACE}"
 echo "kube_context: ${KUBE_CONTEXT}"
-echo "cronjob:      ${CRONJOB_NAME}"
+echo "job_name:     ${JOB_NAME}"
+echo "template:     ${TEMPLATE}"
 echo ""
-echo "The spawned Job Pod runs: python -m app.scheduler.cluster_run"
+echo "Pod command:  python -m app.scheduler.cluster_run"
+echo "The Job Pod schedules namespace-batch Celery tasks and exits (not long-running)."
 echo ""
+
+sed -e "s/rightsizing-REPLACE_ME/${JOB_NAME}/g" \
+    -e "s/right-sizing:REPLACE_ME/right-sizing:${IMAGE_TAG}/g" \
+    -e "s/value: \"prod-us-east-1\"/value: \"${CLUSTER_NAME}\"/" \
+    "${TEMPLATE}" > "${RENDERED}"
 
 echo "[demo] Planned kubectl commands:"
 echo "  kubectl config use-context ${KUBE_CONTEXT}"
-echo "  kubectl -n ${NAMESPACE} get cronjob ${CRONJOB_NAME}"
-echo "  kubectl -n ${NAMESPACE} create job weekly-rightsizing-manual-\$(date +%s) \\"
-echo "    --from=cronjob/${CRONJOB_NAME}"
-echo "  kubectl -n ${NAMESPACE} wait --for=condition=complete job -l job-name --timeout=3600s"
+echo "  kubectl -n ${NAMESPACE} apply -f ${RENDERED}"
+echo "  kubectl -n ${NAMESPACE} wait --for=condition=complete \"job/${JOB_NAME}\" --timeout=3600s"
+echo "  kubectl -n ${NAMESPACE} get job ${JOB_NAME}"
 
 # kubectl config use-context "${KUBE_CONTEXT}"
-# kubectl -n "${NAMESPACE}" create job "weekly-rightsizing-manual-$(date +%s)" \
-#   --from="cronjob/${CRONJOB_NAME}"
+# kubectl -n "${NAMESPACE}" apply -f "${RENDERED}"
+# kubectl -n "${NAMESPACE}" wait --for=condition=complete "job/${JOB_NAME}" --timeout=3600s
 
 echo ""
-echo "[demo] CronJob manual trigger simulation completed for ${CLUSTER_NAME}"
+echo "[demo] Kubernetes Job trigger simulation completed for ${CLUSTER_NAME}"

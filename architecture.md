@@ -37,7 +37,7 @@ right_sizing/
 │   └── integration/                # Recommendations API
 ├── deploy/
 │   ├── clusters.yaml               # Multi-cluster inventory
-│   └── k8s/cronjob.yaml            # Weekly Tuesday CronJob (production design)
+│   └── k8s/job-template.yaml       # Kubernetes Job template (weekly execution)
 ├── scripts/                        # deploy, verify, trigger_weekly
 ├── .gitlab-ci.yml
 ├── docker-compose.yml
@@ -100,7 +100,7 @@ See **§3 Recommendation Logic** for policy details.
 | `batching.py` | `chunk_namespaces()` | Split namespace list into batches (default 50) |
 | `cluster_run.py` | `discover_namespaces()`, `schedule_cluster_rightsizing_run()` | Cluster-level parent job + enqueue batch tasks |
 
-**Production model:** Kubernetes CronJob triggers **one cluster-level run**. Celery parallelizes **namespace batches** — not one task for the entire cluster.
+**Production model:** **GitLab Schedule is the primary scheduler**; a **Kubernetes Job** is the execution mechanism (short-lived Pod runs `cluster_run`). Celery parallelizes **namespace batches** — not one task for the entire cluster.
 
 ### `tasks/pipeline.py` — Celery orchestration
 
@@ -288,10 +288,16 @@ CREATE INDEX idx_recommendations_namespace ON recommendations(namespace);
 ### Cluster-level run (production design)
 
 ```
-Kubernetes CronJob (per cluster)
+GitLab Pipeline Schedule
         │
         ▼
-python -m app.scheduler.cluster_run   (CronJob container command)
+GitLab Pipeline → schedule_weekly_rightsizing (kubectl; no Python on runner)
+        │
+        ▼
+Kubernetes Job (per cluster, e.g. rightsizing-<timestamp>)
+        │
+        ▼
+Pod: python -m app.scheduler.cluster_run
         │
         ▼
 schedule_cluster_rightsizing_run(cluster, whitelist?, blacklist?, batch_size=50)
@@ -378,10 +384,16 @@ Kubernetes    Prometheus    Cloudability    AWS Pricing
                          Detailed data via API or report_url
 ```
 
-### Cluster CronJob → parallel batches
+### GitLab Schedule → Kubernetes Job → parallel batches
 
 ```
-Kubernetes CronJob
+GitLab Schedule
+        ↓
+GitLab Pipeline
+        ↓
+schedule_weekly_rightsizing → kubectl create Job (from job-template.yaml)
+        ↓
+Kubernetes Job → Pod
         ↓
 python -m app.scheduler.cluster_run
         ↓
@@ -401,6 +413,8 @@ PostgreSQL (single parent job_id)
         ├─► Recommendations API
         └─► Report Generator → Notification → Email Recipient
 ```
+
+The Job Pod is **not long-running**: it enqueues Celery batch tasks and exits. Completed Jobs are cleaned up via `ttlSecondsAfterFinished: 86400` (24 hours).
 
 ### Request path (manual API)
 
@@ -437,7 +451,7 @@ GET /api/v1/recommendations (full detail, filters, pagination)
 | Email section | Content |
 |---------------|---------|
 | Header | Job ID, total recommendations, total aggressive estimated savings |
-| Table | Namespace, service, current/recommended CPU & memory, estimated savings |
+| Table | Namespace, workload, request/P95/aggressive/conservative CPU & memory, estimated savings |
 | Footer | `report_url` → detailed recommendations |
 
 **Demo:** `MockEmailSender` appends to `sent_messages`.  
@@ -447,7 +461,16 @@ GET /api/v1/recommendations (full detail, filters, pagination)
 
 ## 9. Deployment Architecture
 
-GitLab CI/CD orchestrates build, validation, per-environment rollout, and simulated weekly job triggers.
+GitLab CI/CD orchestrates build, validation, per-environment rollout, and **weekly scheduling**. **GitLab Schedule is the primary scheduler.** **Kubernetes Job is the execution mechanism.**
+
+### Separation of concerns
+
+| Concern | Owner |
+|---------|--------|
+| **When** the weekly run happens | GitLab Pipeline Schedule (`CI_PIPELINE_SOURCE=schedule`) |
+| **Audit / manual runs** | GitLab pipeline history; `RUN_WEEKLY_RIGHTSIZER=true` for operator tests |
+| **Where** Python scheduler runs | Kubernetes Job Pod inside the target cluster |
+| **Parallel analysis** | Celery workers (unchanged) |
 
 ```
 GitLab CI — application delivery (.gitlab-ci.yml)
@@ -459,28 +482,31 @@ GitLab CI — application delivery (.gitlab-ci.yml)
    deploy_dev → verify_dev_result (dev clusters only, demo)
         │
         ▼
-   (push pipeline ends)
+   (push pipeline ends — no weekly Job on every push)
 
-Kubernetes CronJob (production runtime)
-   deploy/k8s/cronjob.yaml — Tuesday 08:00 UTC
+GitLab Pipeline Schedule (primary scheduler)
         │
         ▼
-   python -m app.scheduler.cluster_run
+   schedule_job → schedule_weekly_rightsizing
+        │
+        ▼
+   trigger_weekly_job.sh → kubectl apply Job (rightsizing-<timestamp>)
+        │
+        ▼
+   Pod: python -m app.scheduler.cluster_run
         │
         ▼
    schedule_cluster_rightsizing_run → Celery batches → PostgreSQL → report/email
-
-Optional: GitLab schedule_weekly_rightsizing → trigger_weekly_job.sh
-   (manual one-off Job from CronJob template; not the primary scheduler)
 ```
 
 | Artifact | Role |
 |----------|------|
-| `.gitlab-ci.yml` | App delivery stages + `schedule_weekly_rightsizing` (schedule-only) |
+| `.gitlab-ci.yml` | App delivery + `schedule_weekly_rightsizing` (intended for Pipeline Schedule) |
+| `deploy/k8s/job-template.yaml` | Job manifest: `cluster_run` command, `ttlSecondsAfterFinished: 86400` |
 | `deploy/clusters.yaml` | Cluster inventory (name, env, namespace, kube_context) |
 | `scripts/deploy_to_cluster.sh` | Deploy hook (demo echo; commented `kubectl` for production) |
 | `scripts/verify_cluster.sh` | Post-deploy verification |
-| `scripts/trigger_weekly_job.sh` | Manual kubectl helper to spawn a Job from CronJob (optional CI) |
+| `scripts/trigger_weekly_job.sh` | Render template + `kubectl apply` one-off Job per cluster |
 
 See **§10 Multi-Cluster Deployment** for cluster-level job layout.
 
@@ -498,7 +524,7 @@ See **§10 Multi-Cluster Deployment** for cluster-level job layout.
 
 ### Demo CI scope (dev only)
 
-Push pipelines deploy and verify **dev-us-east-1** and **dev-us-west-2** only. Weekly rightsizing runs via the **in-cluster CronJob** (`python -m app.scheduler.cluster_run`), not as part of every code push.
+Push pipelines deploy and verify **dev-us-east-1** and **dev-us-west-2** only. Weekly rightsizing is triggered by **GitLab Pipeline Schedule** → `schedule_weekly_rightsizing` → **Kubernetes Job**, not on every code push and not via an in-cluster CronJob.
 
 ### Environment promotion (production design)
 
@@ -589,7 +615,7 @@ Startup: `docker compose up --build`
 ### Namespace-batch parallelism (no workflow engine)
 
 **Chose:** Parent `jobs` row + `total_batches` / `completed_batches` counters; one Celery task per namespace batch.  
-**Why:** Matches production CronJob-per-cluster model; scales to hundreds of namespaces across workers without a monolithic task.  
+**Why:** Matches production GitLab-scheduled Job-per-cluster model; scales to hundreds of namespaces across workers without a monolithic task.  
 **Tradeoff:** Concurrent batch completion uses simple counter increment (demo); production may want atomic SQL `UPDATE ... RETURNING` for strict correctness.
 
 ### Redis broker + PostgreSQL job state
@@ -605,7 +631,7 @@ Startup: `docker compose up --build`
 | Concern | Demo | Production |
 |---------|------|------------|
 | Collectors | Mock dataclasses | Real Prometheus, K8s API, Cloudability, AWS Pricing API |
-| Scheduling | Manual POST + CI `trigger_weekly_*` | `deploy/k8s/cronjob.yaml` per cluster |
+| Scheduling | Manual POST `/api/v1/jobs` | GitLab Pipeline Schedule → `deploy/k8s/job-template.yaml` Job per cluster |
 | Email | `MockEmailSender` | SES, SMTP, SendGrid |
 | UI | Recommendations API only | Frontend linked from `report_url` |
 | CI deploy | Shell echo | Real `kubectl` with per-cluster kubeconfig |

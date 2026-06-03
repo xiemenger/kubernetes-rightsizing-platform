@@ -67,7 +67,7 @@ def _parse_csv_env(name: str) -> Optional[List[str]]:
 
 def main() -> None:
     """
-    Kubernetes CronJob / Job entrypoint.
+    Kubernetes Job entrypoint (scheduled by GitLab Pipeline Schedule).
 
     Reads scheduler configuration from environment variables and starts a
     cluster-level rightsizing run via schedule_cluster_rightsizing_run().

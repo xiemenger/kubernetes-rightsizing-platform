@@ -25,7 +25,7 @@
 |------|----------------------------------|----------------------------|
 | Collectors | Mock implementations with realistic static data | Real K8s, Prometheus, Cloudability, and AWS pricing APIs |
 | Job execution | Celery worker + Redis | Kubernetes Job/Pod or in-cluster worker |
-| Job trigger | `POST /api/v1/jobs` | Weekly Kubernetes CronJob (Tuesday) per cluster |
+| Job trigger | `POST /api/v1/jobs` | GitLab Pipeline Schedule → Kubernetes Job per cluster |
 | Report delivery | Wired after parent job completion via `MockEmailSender` (demo) | SES, SMTP, SendGrid, or internal notification services |
 | Detailed UI | `GET /api/v1/recommendations` | Frontend report page linked from email |
 | CI/CD deploy | Echo scripts simulating deploy/verify/trigger | Real `kubectl` + cluster kubeconfig per job |
@@ -83,16 +83,57 @@ Kubernetes          Prometheus          Cloudability          AWS Pricing
 
 ## 3. End-to-End Workflow
 
-### Cluster-level run (production design)
+### Scheduling (production design)
 
-A **Kubernetes CronJob** triggers one rightsizing run **per cluster**. Within the cluster, work is parallelized by **namespace batch** — not a single monolithic Celery task for the whole cluster.
+**GitLab Schedule is the primary scheduler.** **Kubernetes Job is the execution mechanism.** Celery workers are unchanged.
 
 ```
-Kubernetes CronJob (per cluster, Tuesday 08:00 UTC)
+GitLab Pipeline Schedule (e.g. Tuesday 08:00 UTC)
         ↓
-Container: python -m app.scheduler.cluster_run
+GitLab Pipeline → schedule_weekly_rightsizing
         ↓
-schedule_cluster_rightsizing_run()  (env: CLUSTER_NAME, whitelist/blacklist, BATCH_SIZE)
+kubectl apply Job (rightsizing-<timestamp>) from deploy/k8s/job-template.yaml
+        ↓
+Kubernetes Job → Pod
+        ↓
+python -m app.scheduler.cluster_run
+        ↓
+schedule_cluster_rightsizing_run()
+        ↓
+Namespace discovery → filtering → batching
+        ↓
+Celery workers (one task per namespace batch)
+        ↓
+PostgreSQL → Report / Email
+```
+
+**Why GitLab Schedule?**
+
+- Easier schedule management (UI, cron expressions, timezone)
+- Centralized run history in GitLab pipelines
+- Manual “Run pipeline” / schedule overrides without cluster changes
+- Operational visibility alongside build and deploy pipelines
+
+**Separation of concerns**
+
+| Layer | Responsibility |
+|-------|----------------|
+| **GitLab Schedule** | When the weekly run happens; audit trail; manual execution |
+| **Kubernetes Job** | Run the scheduler entrypoint inside the cluster (short-lived Pod) |
+| **Celery** | Parallel namespace-batch analysis (unchanged) |
+
+The Job Pod is **not long-running**. It runs `python -m app.scheduler.cluster_run`, enqueues namespace-batch Celery tasks, then **exits successfully**. That is why a **Job** is used instead of a Deployment or in-cluster CronJob.
+
+### Cluster-level run (inside the cluster)
+
+Within each cluster, work is parallelized by **namespace batch** — not a single monolithic Celery task for the whole cluster.
+
+```
+Kubernetes Job Pod (per cluster)
+        ↓
+python -m app.scheduler.cluster_run
+        ↓
+schedule_cluster_rightsizing_run()  (env: CLUSTER_NAME, optional whitelist/blacklist, BATCH_SIZE)
         ↓
 Namespace discovery (list_namespaces)
         ↓
@@ -132,9 +173,7 @@ POST /api/v1/jobs  →  run_rightsizing_job
 3. When `completed_batches >= total_batches`, parent job status becomes `completed`.
 4. Report and email remain **cluster-level** after the parent job completes.
 
-Manifest: `deploy/k8s/cronjob.yaml` (`schedule: "0 8 * * 2"`). The CronJob container runs `python -m app.scheduler.cluster_run` — not an HTTP call to the API.
-
-Optional: GitLab `schedule_weekly_rightsizing` can invoke `scripts/trigger_weekly_job.sh` to create a one-off Job from the CronJob template for testing; execution still happens inside the cluster.
+Manifest: `deploy/k8s/job-template.yaml` (`kind: Job`, `ttlSecondsAfterFinished: 86400`). GitLab `schedule_weekly_rightsizing` applies a uniquely named Job (e.g. `rightsizing-<timestamp>`) via `scripts/trigger_weekly_job.sh` — **no Python on the GitLab runner**.
 
 ---
 
@@ -315,15 +354,17 @@ test → build → smoke_test → deploy_dev → verify_dev_result
 | `deploy_dev` | Demo deploy to `dev-us-east-1`, `dev-us-west-2` |
 | `verify_dev_result` | Post-deploy verify (depends only on matching deploy job) |
 
-### Optional GitLab helper (not the production runtime)
+### Weekly scheduler (`schedule_job` stage)
 
 | Job | When |
 |-----|------|
-| `schedule_weekly_rightsizing` | Only when `RUN_WEEKLY_RIGHTSIZER=true` (optional Pipeline Schedule) |
+| `schedule_weekly_rightsizing` | `CI_PIPELINE_SOURCE=schedule` (GitLab Pipeline Schedule) or `RUN_WEEKLY_RIGHTSIZER=true` (manual test) |
 
-This job runs `scripts/trigger_weekly_job.sh` to **manually spawn** a Kubernetes Job from the CronJob template. Production weekly runs are driven by the **in-cluster CronJob**, not GitLab.
+This job uses **kubectl** (via `scripts/trigger_weekly_job.sh`) to create a **Kubernetes Job** from `deploy/k8s/job-template.yaml`. It does **not** run `python -m app.scheduler.cluster_run` on the GitLab runner.
 
-`deploy/clusters.yaml` lists sit/prd clusters for production design; this demo pipeline omits sit/prd jobs.
+Configure **GitLab → CI/CD → Schedules** (e.g. `0 8 * * 2` Tuesday 08:00 UTC) to trigger this pipeline stage.
+
+`deploy/clusters.yaml` lists sit/prd clusters for production design; this demo pipeline schedules dev clusters only.
 
 Helper scripts: `scripts/deploy_to_cluster.sh`, `scripts/verify_cluster.sh`, `scripts/trigger_weekly_job.sh`.
 
@@ -359,7 +400,7 @@ right_sizing/
 ├── deploy/
 │   ├── clusters.yaml                 # Multi-cluster inventory
 │   └── k8s/
-│       └── cronjob.yaml                # Weekly Tuesday CronJob (production design)
+│       └── job-template.yaml           # Kubernetes Job template (weekly execution)
 ├── scripts/
 │   ├── deploy_to_cluster.sh
 │   ├── verify_cluster.sh
@@ -399,7 +440,7 @@ right_sizing/
 - **Integration testing** — HTTP API against in-memory SQLite
 - **GitLab CI/CD** — staged pipeline with per-cluster visibility
 - **Multi-cluster deployment** — env promotion dev → sit → prd
-- **Scheduled Kubernetes workloads** — CronJob design for weekly analysis
+- **GitLab Schedule + Kubernetes Job** — schedule when; cluster Job executes scheduler entrypoint
 - **Reporting and notification systems** — summary email + detailed API for drill-down
 
 ---
