@@ -18,6 +18,10 @@ right_sizing/
 │   │   ├── jobs.py                 # POST/GET /api/v1/jobs
 │   │   └── recommendations.py      # GET /api/v1/recommendations
 │   ├── collectors/                 # K8s, Prometheus, Cloudability, AWS pricing (mock)
+│   ├── scheduler/
+│   │   ├── namespace_selector.py   # whitelist / blacklist
+│   │   ├── batching.py             # chunk_namespaces (default 50)
+│   │   └── cluster_run.py          # schedule_cluster_rightsizing_run
 │   ├── engine/
 │   │   └── rightsizer.py           # RightsizerEngine, RecommendationConfig
 │   ├── reports/                    # Report generator + notification
@@ -26,7 +30,7 @@ right_sizing/
 │   ├── models/
 │   │   └── schema.py               # Job, Recommendation ORM
 │   ├── tasks/
-│   │   └── pipeline.py             # Celery run_rightsizing_job
+│   │   └── pipeline.py             # run_rightsizing_batch_job + legacy run_rightsizing_job
 │   └── config.py
 ├── tests/
 │   ├── unit/                       # Engine, report, email
@@ -52,7 +56,7 @@ Demo collectors return typed dataclasses; production implementations replace the
 
 | Collector | Output type | Data |
 |-----------|-------------|------|
-| `MockKubernetesCollector` | `ServiceSpecification` | `cpu_request_cores`, `mem_request_mib` per service |
+| `MockKubernetesCollector` | `list_namespaces()`, `ServiceSpecification` | Namespace discovery; services filtered per batch |
 | `MockPrometheusCollector` | `ServiceMetrics` | `cpu_p95_cores`, `mem_p95_mib` (P95 over rolling window) |
 | `MockCloudabilityCollector` | `ServiceCostInfo` | `weekly_cost_usd` (optional — never fabricated when missing) |
 | `MockAwsPricingCollector` | `AwsResourcePricing` | Normalized `cpu_cost_per_core_hour`, `mem_cost_per_mib_hour` |
@@ -86,11 +90,28 @@ See **§3 Recommendation Logic** for policy details.
 | `report_generator.py` | `ReportRow`, `ReportSummary`, `generate_report_summary()` from ORM rows |
 | `email_sender.py` | `format_report_email_body()`, `MockEmailSender` (records messages in demo) |
 
-**Status:** Modules are implemented. The Celery task persists recommendations only; report + email are invoked after job completion (production worker or operator automation). Not auto-wired in `pipeline.py` yet.
+**Status:** Wired in `pipeline.py` — when all namespace batches complete, `_send_completion_report` uses `MockEmailSender` (demo). Production: replace with SES / SMTP / SendGrid.
+
+### `scheduler/` — Namespace batch orchestration
+
+| Module | Function | Role |
+|--------|----------|------|
+| `namespace_selector.py` | `select_namespaces()` | Whitelist (optional), then blacklist removal |
+| `batching.py` | `chunk_namespaces()` | Split namespace list into batches (default 50) |
+| `cluster_run.py` | `discover_namespaces()`, `schedule_cluster_rightsizing_run()` | Cluster-level parent job + enqueue batch tasks |
+
+**Production model:** Kubernetes CronJob triggers **one cluster-level run**. Celery parallelizes **namespace batches** — not one task for the entire cluster.
 
 ### `tasks/pipeline.py` — Celery orchestration
 
-`run_rightsizing_job(job_id)` runs inside Flask app context: update job status → collectors → engine → bulk persist → `completed` / `failed`.
+| Task | Scope |
+|------|--------|
+| `run_rightsizing_batch_job(job_id, cluster, namespaces)` | One namespace batch; persists under shared parent `job_id` |
+| `run_rightsizing_job(job_id)` | **Legacy** — all services in a single worker task |
+
+Shared helper: `_execute_rightsizing_for_namespaces()` — collectors scoped to `namespaces` list.
+
+Parent job tracks `total_batches` / `completed_batches`; status becomes `completed` when all batches finish.
 
 ### `app/__init__.py` — Flask factory
 
@@ -151,12 +172,15 @@ Savings estimate (`_estimate_savings`): proportional reduction from current requ
 
 ```sql
 CREATE TABLE jobs (
-    id          UUID PRIMARY KEY,
-    status      VARCHAR(20) NOT NULL DEFAULT 'pending',
-                -- pending | running | completed | failed
-    created_at  TIMESTAMPTZ NOT NULL,
-    updated_at  TIMESTAMPTZ NOT NULL,
-    error       TEXT
+    id                UUID PRIMARY KEY,
+    status            VARCHAR(20) NOT NULL DEFAULT 'pending',
+                      -- pending | running | completed | failed
+    created_at        TIMESTAMPTZ NOT NULL,
+    updated_at        TIMESTAMPTZ NOT NULL,
+    error             TEXT,
+    cluster           VARCHAR(255),      -- cluster-level run identifier
+    total_batches     INTEGER,           -- namespace batches enqueued
+    completed_batches INTEGER NOT NULL DEFAULT 0
 );
 ```
 
@@ -261,47 +285,56 @@ CREATE INDEX idx_recommendations_namespace ON recommendations(namespace);
 
 ## 6. Celery Workflow
 
+### Cluster-level run (production design)
+
 ```
-HTTP POST /api/v1/jobs
+Kubernetes CronJob (per cluster)
         │
         ▼
-Flask: Job(status=pending) → db.commit()
+python -m app.scheduler.cluster_run   (CronJob container command)
         │
         ▼
-run_rightsizing_job.delay(job_id)  →  Redis broker
+schedule_cluster_rightsizing_run(cluster, whitelist?, blacklist?, batch_size=50)
         │
-        ▼ (Celery worker)
-Job(status=running)
-        │
-        ├─ MockKubernetesCollector.collect_services()
-        ├─ MockPrometheusCollector.collect_metrics(services)
-        ├─ MockCloudabilityCollector.collect_costs(services)
-        ├─ MockAwsPricingCollector.get_pricing(region)
-        │
-        ├─ RightsizerEngine(RecommendationConfig.defaults())
-        │     .generate_recommendations(...)
-        │
-        ├─ Persist Recommendation rows → PostgreSQL
-        │
-        └─ Job(status=completed | failed)
-        │
-        ▼ (post-completion — demo: explicit call; production: worker hook)
-generate_report_summary(job_id, recommendations)
+        ├─ Create parent Job (cluster, total_batches)
+        ├─ discover_namespaces() → MockKubernetesCollector.list_namespaces()
+        ├─ select_namespaces() → whitelist / blacklist
+        └─ chunk_namespaces() → batches of ≤50 namespaces
         │
         ▼
-MockEmailSender.send_report(recipients, summary)
+For each batch: run_rightsizing_batch_job.delay(job_id, cluster, batch)
+        │
+        ▼ (N Celery workers in parallel)
+Per batch:
+        ├─ collect_services(namespaces=batch)
+        ├─ collect_metrics(services)
+        ├─ collect_costs(services)
+        ├─ RightsizerEngine → persist recommendations (same job_id)
+        └─ increment completed_batches; parent → completed when done
+        │
+        ▼ (cluster-level, after parent job completed)
+generate_report_summary → MockEmailSender → GET /api/v1/recommendations
+```
+
+### Legacy single-task run (demo backward compatibility)
+
+```
+POST /api/v1/jobs (no JSON body)
         │
         ▼
-Recipient → GET /api/v1/recommendations?job_id=...
+run_rightsizing_job.delay(job_id)
+        │
+        ▼
+collect_services() — all namespaces → engine → completed
 ```
 
 **Configuration:**
 
 - Broker / backend: Redis (`REDIS_URL`)
 - `task_acks_late=True`, `worker_prefetch_multiplier=1`
-- `max_retries=3` on `run_rightsizing_job`
+- `max_retries=3` on batch and legacy tasks
 
-**Production alternatives:** SQS/RabbitMQ broker; Kubernetes Job instead of Celery worker; wire report send inside worker after commit.
+**Intentionally omitted:** `job_batches` table, distributed locks, workflow engines — batch tracking uses counters on the parent `jobs` row only.
 
 ---
 
@@ -345,20 +378,44 @@ Kubernetes    Prometheus    Cloudability    AWS Pricing
                          Detailed data via API or report_url
 ```
 
-### Request path (manual trigger)
+### Cluster CronJob → parallel batches
+
+```
+Kubernetes CronJob
+        ↓
+python -m app.scheduler.cluster_run
+        ↓
+schedule_cluster_rightsizing_run()
+        ↓
+Namespace discovery
+        ↓
+Namespace filtering (whitelist / blacklist)
+        ↓
+Namespace batching (default 50)
+        ↓
+Celery workers (one task per batch, parallel)
+        ↓
+RightsizerEngine
+        ↓
+PostgreSQL (single parent job_id)
+        ├─► Recommendations API
+        └─► Report Generator → Notification → Email Recipient
+```
+
+### Request path (manual API)
 
 ```
 Client / CI
-    │ POST /api/v1/jobs
+    │ POST /api/v1/jobs  {"cluster": "...", "blacklist": ["kube-system"]}
     ▼
-Flask API ──enqueue──► Redis ──dequeue──► Celery Worker
-    │                                              │
-    │ insert Job                                   │ collectors → engine
-    ▼                                              ▼
-PostgreSQL ◄──────────────────────────── bulk insert recommendations
-    │
-    ├──► Flask GET recommendations (polling / dashboards)
-    └──► Report + email (after job completed)
+schedule_cluster_rightsizing_run()
+    │ insert parent Job + enqueue batch tasks
+    ▼
+Redis → multiple Celery workers (namespace batches)
+    ▼
+PostgreSQL ← recommendations (shared job_id)
+    ├──► GET /api/v1/recommendations
+    └──► Report + email (cluster-level, after job completed)
 ```
 
 ---
@@ -393,42 +450,37 @@ GET /api/v1/recommendations (full detail, filters, pagination)
 GitLab CI/CD orchestrates build, validation, per-environment rollout, and simulated weekly job triggers.
 
 ```
-GitLab CI (.gitlab-ci.yml)
+GitLab CI — application delivery (.gitlab-ci.yml)
         │
         ▼
-      test          ← pytest (SQLite in CI)
+      test → build → smoke_test
         │
         ▼
-      build         ← Docker image
+   deploy_dev → verify_dev_result (dev clusters only, demo)
         │
         ▼
-   smoke_test       ← container import sanity check
-        │
-        ├──────────────────────────────────────┐
-        ▼                                      ▼
-   deploy_dev → verify_dev → trigger_weekly_dev
-        │ (per cluster in deploy/clusters.yaml)
-        ▼
-   deploy_sit → verify_sit → trigger_weekly_sit
-        │
-        ▼
-   deploy_prd → verify_prd → trigger_weekly_prd
-        │
-        ▼
-Kubernetes CronJob (production)
+   (push pipeline ends)
+
+Kubernetes CronJob (production runtime)
    deploy/k8s/cronjob.yaml — Tuesday 08:00 UTC
         │
         ▼
-Same analysis pipeline as Celery task
+   python -m app.scheduler.cluster_run
+        │
+        ▼
+   schedule_cluster_rightsizing_run → Celery batches → PostgreSQL → report/email
+
+Optional: GitLab schedule_weekly_rightsizing → trigger_weekly_job.sh
+   (manual one-off Job from CronJob template; not the primary scheduler)
 ```
 
 | Artifact | Role |
 |----------|------|
-| `.gitlab-ci.yml` | Stage definitions, per-cluster job templates, `needs` dependencies |
+| `.gitlab-ci.yml` | App delivery stages + `schedule_weekly_rightsizing` (schedule-only) |
 | `deploy/clusters.yaml` | Cluster inventory (name, env, namespace, kube_context) |
 | `scripts/deploy_to_cluster.sh` | Deploy hook (demo echo; commented `kubectl` for production) |
 | `scripts/verify_cluster.sh` | Post-deploy verification |
-| `scripts/trigger_weekly_job.sh` | Simulates weekly CronJob POST/trigger after verify |
+| `scripts/trigger_weekly_job.sh` | Manual kubectl helper to spawn a Job from CronJob (optional CI) |
 
 See **§10 Multi-Cluster Deployment** for cluster-level job layout.
 
@@ -444,19 +496,13 @@ See **§10 Multi-Cluster Deployment** for cluster-level job layout.
 | `sit` | `sit-us-east-1`, `sit-us-west-2` |
 | `prd` | `prd-us-east-1`, `prd-us-west-2` |
 
-### One GitLab job per cluster
+### Demo CI scope (dev only)
 
-Each cluster has its own **deploy → verify → trigger_weekly** chain so the GitLab UI shows **per-cluster success or failure** (e.g. `deploy_dev_us_east_1`, `verify_dev_us_east_1`, `trigger_weekly_dev_us_east_1`).
+Push pipelines deploy and verify **dev-us-east-1** and **dev-us-west-2** only. Weekly rightsizing runs via the **in-cluster CronJob** (`python -m app.scheduler.cluster_run`), not as part of every code push.
 
-`trigger_weekly_*` jobs depend only on the matching `verify_*` job for that cluster—not on all clusters in another region.
+### Environment promotion (production design)
 
-### Environment promotion
-
-```
-dev (all cluster jobs)  →  sit  →  prd
-```
-
-Sit stages run after dev pipeline completes; prd after sit. Mirrors progressive rollout in production.
+Full **dev → sit → prd** rollout and per-cluster jobs are documented in `deploy/clusters.yaml` but omitted from this demo `.gitlab-ci.yml` to keep the pipeline interview-friendly.
 
 ### Scale: 50+ clusters
 
@@ -476,6 +522,10 @@ Future improvement documented in README §10.
 | File | Focus |
 |------|--------|
 | `test_rightsizer.py` | P95 headroom, aggressive vs conservative, Cloudability vs AWS fallback, over/under-provisioned, custom config |
+| `test_namespace_selector.py` | Whitelist, blacklist, combined filters |
+| `test_batching.py` | Batch sizes, empty input, invalid `batch_size` |
+| `test_cluster_run.py` | Parent job creation, batch enqueue, empty filter completion |
+| `test_kubernetes_collector.py` | `list_namespaces`, namespace-scoped collection |
 | `test_report_generator.py` | `generate_report_summary`, sorting, totals |
 | `test_email_sender.py` | Plain-text body, `MockEmailSender` |
 
@@ -487,7 +537,7 @@ Engine tests use **no database and no network** — highest coverage, fastest fe
 - Blueprints: health, jobs, recommendations
 - `test_recommendations_api.py` — filters, `min_aggressive_savings`, sort, pagination, validation
 
-**All 22 pytest tests pass.** CI runs `pytest -v` in the `test` stage with `SQLALCHEMY_DATABASE_URI=sqlite:///:memory:`.
+**All 43 pytest tests pass.** CI runs `pytest -v` in the `test` stage with `SQLALCHEMY_DATABASE_URI=sqlite:///:memory:`.
 
 ### Principles
 
@@ -535,6 +585,12 @@ Startup: `docker compose up --build`
 **Chose:** Separate `app/reports` modules, manual or future hook after commit.  
 **Why:** Clear separation of analysis vs delivery; easy to test email format.  
 **Tradeoff:** Production should invoke send in worker or event handler to avoid missed notifications.
+
+### Namespace-batch parallelism (no workflow engine)
+
+**Chose:** Parent `jobs` row + `total_batches` / `completed_batches` counters; one Celery task per namespace batch.  
+**Why:** Matches production CronJob-per-cluster model; scales to hundreds of namespaces across workers without a monolithic task.  
+**Tradeoff:** Concurrent batch completion uses simple counter increment (demo); production may want atomic SQL `UPDATE ... RETURNING` for strict correctness.
 
 ### Redis broker + PostgreSQL job state
 

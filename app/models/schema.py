@@ -25,12 +25,20 @@ class Job(db.Model):
     )
     error = db.Column(db.Text, nullable=True)
 
+    # Cluster-level runs: parallel namespace batches share one parent job
+    cluster = db.Column(db.String(255), nullable=True)
+    total_batches = db.Column(db.Integer, nullable=True)
+    completed_batches = db.Column(db.Integer, nullable=False, default=0)
+
     recommendations = db.relationship("Recommendation", backref="job", cascade="all, delete-orphan")
 
     def to_dict(self):
         return {
             "job_id": str(self.id),
             "status": self.status,
+            "cluster": self.cluster,
+            "total_batches": self.total_batches,
+            "completed_batches": self.completed_batches,
             "created_at": self.created_at.isoformat() if self.created_at else None,
             "updated_at": self.updated_at.isoformat() if self.updated_at else None,
             "error": self.error,
@@ -116,42 +124,3 @@ class Recommendation(db.Model):
         }
 
 
-'''
-┌──────────────────────────────┐
-│            jobs             │
-├──────────────────────────────┤
-│ id (UUID) PK                │
-│ status                      │
-│ created_at                  │
-│ updated_at                  │
-│ error                       │
-└──────────────┬──────────────┘
-               │
-               │  one-to-many
-               │
-               ▼
-┌──────────────────────────────────────────────┐
-│              recommendations                 │
-├──────────────────────────────────────────────┤
-│ id (UUID) PK                                │
-│ job_id (FK → jobs.id)                       │
-│                                              │
-│ namespace                                    │
-│ pod                                          │
-│ container                                    │
-│                                              │
-│ cpu_request_cores                            │
-│ mem_request_mib                              │
-│ cpu_p95_cores                                │
-│ mem_p95_mib                                  │
-│                                              │
-│ rec_cpu_request_cores                        │
-│ rec_mem_request_mib                          │
-│                                              │
-│ weekly_cost_usd                              │
-│ estimated_weekly_savings_usd                 │
-│ savings_pct                                  │
-│                                              │
-│ created_at                                   │
-└──────────────────────────────────────────────┘
-'''

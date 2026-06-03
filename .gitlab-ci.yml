@@ -1,29 +1,25 @@
-# Multi-cluster rightsizing CI/CD pipeline (demo)
+# Rightsizing platform — GitLab CI/CD (demo)
 #
-# test        — unit + integration tests (in-memory SQLite; no Docker/PostgreSQL)
-# build       — Docker image packaging
-# smoke_test  — quick image sanity check
-# Per-cluster chain (deploy → verify → trigger) for GitLab UI visibility:
-#   dev:  deploy_dev → verify_dev → trigger_weekly_dev
-#   sit:  deploy_sit → verify_sit → trigger_weekly_sit  (after all dev stages pass)
-#   prd:  deploy_prd → verify_prd → trigger_weekly_prd  (after all sit stages pass)
+# Two pipelines, separated by intent:
 #
-# Future enhancements: linting, security scanning, registry push, dynamic child
-# pipelines generated from deploy/clusters.yaml for 50+ production clusters.
+# 1) Application delivery (default — runs on push/MR)
+#    test → build → smoke_test → deploy_dev → verify_dev_result
+#    Validates code, builds the Docker image, smoke-tests the container,
+#    and simulates deploy + verification to dev clusters (no real kubeconfig).
+#
+# 2) Optional manual CronJob trigger (not the production scheduler)
+#    schedule_job → schedule_weekly_rightsizing (RUN_WEEKLY_RIGHTSIZER=true only)
+#    Runs scripts/trigger_weekly_job.sh to create a one-off K8s Job from the CronJob.
+#    Production weekly runs use deploy/k8s/cronjob.yaml:
+#      python -m app.scheduler.cluster_run
 
 stages:
   - test
   - build
   - smoke_test
   - deploy_dev
-  - verify_dev
-  - trigger_weekly_dev
-  - deploy_sit
-  - verify_sit
-  - trigger_weekly_sit
-  - deploy_prd
-  - verify_prd
-  - trigger_weekly_prd
+  - verify_dev_result
+  - schedule_job
 
 variables:
   PIP_CACHE_DIR: "$CI_PROJECT_DIR/.cache/pip"
@@ -65,7 +61,7 @@ build-image:
     - docker image inspect "${IMAGE_NAME}:${CI_COMMIT_SHA}"
 
 # =============================================================================
-# smoke_test — validate container starts (no external DB required)
+# smoke_test — validate container imports (no external DB required)
 # =============================================================================
 smoke-test-image:
   stage: smoke_test
@@ -80,7 +76,7 @@ smoke-test-image:
     - docker run --rm "${IMAGE_NAME}:${CI_COMMIT_SHA}" python -c "import app; print('smoke test OK')"
 
 # =============================================================================
-# Shared templates for cluster operations (demo — no real kubeconfig)
+# deploy_dev — demo deploy simulation (dev clusters only)
 # =============================================================================
 .cluster_script_base:
   image: alpine:3.19
@@ -91,71 +87,32 @@ smoke-test-image:
     - build-image
     - smoke-test-image
 
-.deploy_dev_base:
+deploy_dev_us_east_1:
   extends: .cluster_script_base
   stage: deploy_dev
-
-.verify_dev_base:
-  extends: .cluster_script_base
-  stage: verify_dev
-
-.deploy_sit_base:
-  extends: .cluster_script_base
-  stage: deploy_sit
-
-.verify_sit_base:
-  extends: .cluster_script_base
-  stage: verify_sit
-
-.deploy_prd_base:
-  extends: .cluster_script_base
-  stage: deploy_prd
-
-.verify_prd_base:
-  extends: .cluster_script_base
-  stage: verify_prd
-
-# Trigger jobs depend only on the matching verify job in the same cluster chain.
-.trigger_script_base:
-  image: alpine:3.19
-  before_script:
-    - apk add --no-cache bash
-    - chmod +x scripts/*.sh
-
-.trigger_weekly_dev_base:
-  extends: .trigger_script_base
-  stage: trigger_weekly_dev
-
-.trigger_weekly_sit_base:
-  extends: .trigger_script_base
-  stage: trigger_weekly_sit
-
-.trigger_weekly_prd_base:
-  extends: .trigger_script_base
-  stage: trigger_weekly_prd
-
-# =============================================================================
-# deploy_dev — one GitLab job per cluster for pipeline visibility
-# =============================================================================
-deploy_dev_us_east_1:
-  extends: .deploy_dev_base
   script:
     - ./scripts/deploy_to_cluster.sh dev-us-east-1 dev rightsizing dev-us-east-1 "${CI_COMMIT_SHA}"
 
 deploy_dev_us_west_2:
-  extends: .deploy_dev_base
+  extends: .cluster_script_base
+  stage: deploy_dev
   script:
     - ./scripts/deploy_to_cluster.sh dev-us-west-2 dev rightsizing dev-us-west-2 "${CI_COMMIT_SHA}"
 
 # =============================================================================
-# verify_dev
+# verify_dev_result — post-deploy checks (one job per dev cluster)
 # =============================================================================
+.verify_dev_base:
+  image: alpine:3.19
+  stage: verify_dev_result
+  before_script:
+    - apk add --no-cache bash
+    - chmod +x scripts/*.sh
+
 verify_dev_us_east_1:
   extends: .verify_dev_base
   needs:
     - job: deploy_dev_us_east_1
-    - job: build-image
-    - job: smoke-test-image
   script:
     - ./scripts/verify_cluster.sh dev-us-east-1 rightsizing dev-us-east-1
 
@@ -163,126 +120,21 @@ verify_dev_us_west_2:
   extends: .verify_dev_base
   needs:
     - job: deploy_dev_us_west_2
-    - job: build-image
-    - job: smoke-test-image
   script:
     - ./scripts/verify_cluster.sh dev-us-west-2 rightsizing dev-us-west-2
 
 # =============================================================================
-# deploy_sit — runs only after verify_dev stage succeeds
+# schedule_job — optional manual CronJob trigger (not production runtime)
 # =============================================================================
-deploy_sit_us_east_1:
-  extends: .deploy_sit_base
-  script:
-    - ./scripts/deploy_to_cluster.sh sit-us-east-1 sit rightsizing sit-us-east-1 "${CI_COMMIT_SHA}"
-
-deploy_sit_us_west_2:
-  extends: .deploy_sit_base
-  script:
-    - ./scripts/deploy_to_cluster.sh sit-us-west-2 sit rightsizing sit-us-west-2 "${CI_COMMIT_SHA}"
-
-# =============================================================================
-# verify_sit
-# =============================================================================
-verify_sit_us_east_1:
-  extends: .verify_sit_base
-  needs:
-    - job: deploy_sit_us_east_1
-    - job: build-image
-    - job: smoke-test-image
-  script:
-    - ./scripts/verify_cluster.sh sit-us-east-1 rightsizing sit-us-east-1
-
-verify_sit_us_west_2:
-  extends: .verify_sit_base
-  needs:
-    - job: deploy_sit_us_west_2
-    - job: build-image
-    - job: smoke-test-image
-  script:
-    - ./scripts/verify_cluster.sh sit-us-west-2 rightsizing sit-us-west-2
-
-# =============================================================================
-# deploy_prd — runs only after verify_sit stage succeeds
-# =============================================================================
-deploy_prd_us_east_1:
-  extends: .deploy_prd_base
-  script:
-    - ./scripts/deploy_to_cluster.sh prd-us-east-1 prd rightsizing prd-us-east-1 "${CI_COMMIT_SHA}"
-
-deploy_prd_us_west_2:
-  extends: .deploy_prd_base
-  script:
-    - ./scripts/deploy_to_cluster.sh prd-us-west-2 prd rightsizing prd-us-west-2 "${CI_COMMIT_SHA}"
-
-# =============================================================================
-# verify_prd
-# =============================================================================
-verify_prd_us_east_1:
-  extends: .verify_prd_base
-  needs:
-    - job: deploy_prd_us_east_1
-    - job: build-image
-    - job: smoke-test-image
-  script:
-    - ./scripts/verify_cluster.sh prd-us-east-1 rightsizing prd-us-east-1
-
-verify_prd_us_west_2:
-  extends: .verify_prd_base
-  needs:
-    - job: deploy_prd_us_west_2
-    - job: build-image
-    - job: smoke-test-image
-  script:
-    - ./scripts/verify_cluster.sh prd-us-west-2 rightsizing prd-us-west-2
-
-# =============================================================================
-# trigger_weekly_dev — each job depends only on its cluster verify_dev job
-# =============================================================================
-trigger_weekly_dev_us_east_1:
-  extends: .trigger_weekly_dev_base
-  needs:
-    - job: verify_dev_us_east_1
+schedule_weekly_rightsizing:
+  stage: schedule_job
+  image: alpine:3.19
+  before_script:
+    - apk add --no-cache bash
+    - chmod +x scripts/*.sh
+  rules:
+    - if: '$RUN_WEEKLY_RIGHTSIZER == "true"'
+    - when: never
   script:
     - ./scripts/trigger_weekly_job.sh dev-us-east-1 rightsizing dev-us-east-1
-
-trigger_weekly_dev_us_west_2:
-  extends: .trigger_weekly_dev_base
-  needs:
-    - job: verify_dev_us_west_2
-  script:
     - ./scripts/trigger_weekly_job.sh dev-us-west-2 rightsizing dev-us-west-2
-
-# =============================================================================
-# trigger_weekly_sit — each job depends only on its cluster verify_sit job
-# =============================================================================
-trigger_weekly_sit_us_east_1:
-  extends: .trigger_weekly_sit_base
-  needs:
-    - job: verify_sit_us_east_1
-  script:
-    - ./scripts/trigger_weekly_job.sh sit-us-east-1 rightsizing sit-us-east-1
-
-trigger_weekly_sit_us_west_2:
-  extends: .trigger_weekly_sit_base
-  needs:
-    - job: verify_sit_us_west_2
-  script:
-    - ./scripts/trigger_weekly_job.sh sit-us-west-2 rightsizing sit-us-west-2
-
-# =============================================================================
-# trigger_weekly_prd — each job depends only on its cluster verify_prd job
-# =============================================================================
-trigger_weekly_prd_us_east_1:
-  extends: .trigger_weekly_prd_base
-  needs:
-    - job: verify_prd_us_east_1
-  script:
-    - ./scripts/trigger_weekly_job.sh prd-us-east-1 rightsizing prd-us-east-1
-
-trigger_weekly_prd_us_west_2:
-  extends: .trigger_weekly_prd_base
-  needs:
-    - job: verify_prd_us_west_2
-  script:
-    - ./scripts/trigger_weekly_job.sh prd-us-west-2 rightsizing prd-us-west-2

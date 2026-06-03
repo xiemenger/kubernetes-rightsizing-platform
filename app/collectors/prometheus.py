@@ -78,76 +78,115 @@ class MockPrometheusCollector(BasePrometheusCollector):
 # ==============================================================================
 # PRODUCTION INTEGRATION NOTES
 # ==============================================================================
-# To transition from the mock collector to a real Prometheus API integration:
+# To transition from the mock collector to a real Prometheus HTTP API integration:
 #
-# 1. Install an HTTP client like `requests` or `httpx`:
+# 1. Install an HTTP client (not required for the demo):
 #    $ pip install httpx
 #
-# 2. Query Prometheus HTTP API using PromQL (Prometheus Query Language).
-#    Prometheus exposes a REST endpoint: `/api/v1/query` and `/api/v1/query_range`.
+# 2. Wire ProductionPrometheusCollector in the Celery batch worker instead of
+#    MockPrometheusCollector. Namespace whitelist / blacklist should be applied
+#    in app.scheduler before services are collected when possible.
 #
-#    Example query parameters for weekly P95 CPU usage over a 7-day window:
-#    - Query: quantile_over_time(0.95, rate(container_cpu_usage_seconds_total{namespace="production", container!=""}[5m])[7d])
+# 3. Production caveats:
+#    - Prometheus label conventions vary by cluster (pod, app, workload, etc.).
+#    - Workload-to-pod matching may require Deployment / ReplicaSet ownership
+#      mapping rather than a simple pod=~"<service>.*" regex.
+#    - Prefer recording rules for expensive long-window P95 queries at scale.
+#    - Query windows should be configurable (e.g. 7d, 14d, 30d) via env or config.
+#    - Handle missing metrics gracefully (return 0.0 or skip with explicit policy).
+#    - Apply namespace whitelist / blacklist before querying to reduce load.
 #
-#    Example query parameters for weekly P95 memory usage over a 7-day window:
-#    - Query: quantile_over_time(0.95, container_memory_working_set_bytes{namespace="production", container!=""}[7d])
+# 4. Example PromQL (substitute <namespace> and <service> per workload):
 #
-# 3. Implement the BasePrometheusCollector:
+# CPU P95:
+# quantile_over_time(
+#   0.95,
+#   sum(rate(container_cpu_usage_seconds_total{
+#     namespace="<namespace>",
+#     container!="",
+#     image!="",
+#     pod=~"<service>.*"
+#   }[5m]))[7d:]
+# )
 #
-#    import httpx
+# Memory P95 (bytes; divide by 1024 * 1024 for MiB):
+# quantile_over_time(
+#   0.95,
+#   max(container_memory_working_set_bytes{
+#     namespace="<namespace>",
+#     container!="",
+#     image!="",
+#     pod=~"<service>.*"
+#   })[7d:]
+# )
 #
-#    class ProductionPrometheusCollector(BasePrometheusCollector):
-#        def __init__(self, prometheus_url: str):
-#            self.prometheus_url = prometheus_url.rstrip("/")
+# 5. Example production collector skeleton (illustrative — keep commented):
 #
-#        def collect_metrics(self, services: List[ServiceSpecification]) -> List[ServiceMetrics]:
-#            metrics = []
-#            with httpx.Client() as client:
-#                for svc in services:
-#                    # 1. Fetch P95 CPU usage over the last 7 days
-#                    # We query kube-state-metrics and container metrics aggregated by service namespace and deployment
-#                    cpu_query = (
-#                        f'sum(quantile_over_time(0.95, rate(container_cpu_usage_seconds_total{{'
-#                        f'namespace="{svc.namespace}", pod=~"{svc.service_name}-.*"}}[5m])[7d]))'
-#                    )
-#                    cpu_val = self._query_single_value(client, cpu_query)
-#
-#                    # 2. Fetch P95 memory usage over the last 7 days
-#                    mem_query = (
-#                        f'sum(quantile_over_time(0.95, container_memory_working_set_bytes{{'
-#                        f'namespace="{svc.namespace}", pod=~"{svc.service_name}-.*"}}[7d]))'
-#                    )
-#                    mem_bytes = self._query_single_value(client, mem_query)
-#                    mem_mib = mem_bytes / (1024.0 * 1024.0) if mem_bytes else 0.0
-#
-#                    metrics.append(
-#                        ServiceMetrics(
-#                            cluster=svc.cluster,
-#                            namespace=svc.namespace,
-#                            service_name=svc.service_name,
-#                            cpu_p95_cores=cpu_val if cpu_val else 0.0,
-#                            mem_p95_mib=mem_mib
-#                        )
-#                    )
-#            return metrics
-#
-#        def _query_single_value(self, client: httpx.Client, query: str) -> float:
-#            response = client.get(
-#                f"{self.prometheus_url}/api/v1/query",
-#                params={"query": query}
-#            )
-#            if response.status_code != 200:
-#                # In production, handle errors or log them
-#                return 0.0
-#            
-#            data = response.json()
-#            results = data.get("data", {}).get("result", [])
-#            if not results:
-#                return 0.0
-#            
-#            # Result format: {"metric": {}, "value": [timestamp, "value_string"]}
-#            try:
-#                return float(results[0]["value"][1])
-#            except (ValueError, IndexError, KeyError):
-#                return 0.0
+import httpx
+
+class ProductionPrometheusCollector(BasePrometheusCollector):
+    """
+    Production collector querying Prometheus instant query API for P95 usage.
+    """
+
+    def __init__(self, prometheus_url: str, timeout_seconds: int = 10):
+        self.prometheus_url = prometheus_url.rstrip("/")
+        self.timeout_seconds = timeout_seconds
+        # Optional: self.observation_window = "7d"  # or 14d / 30d from config
+
+    def collect_metrics(self, services: List[ServiceSpecification]) -> List[ServiceMetrics]:
+        metrics: List[ServiceMetrics] = []
+        for service in services:
+            namespace = service.namespace
+            workload = service.service_name
+            window = "7d"  # configurable in production
+
+            cpu_query = (
+                f'quantile_over_time(0.95, sum(rate(container_cpu_usage_seconds_total{{'
+                f'namespace="{namespace}", container!="", image!="", '
+                f'pod=~"{workload}.*"}}[5m]))[{window}:])'
+            )
+            mem_query = (
+                f'quantile_over_time(0.95, max(container_memory_working_set_bytes{{'
+                f'namespace="{namespace}", container!="", image!="", '
+                f'pod=~"{workload}.*"}})[{window}:])'
+            )
+
+            cpu_p95_cores = self._query_prometheus(cpu_query)
+            mem_p95_bytes = self._query_prometheus(mem_query)
+            mem_p95_mib = mem_p95_bytes / (1024.0 * 1024.0)
+
+            metrics.append(
+                ServiceMetrics(
+                    cluster=service.cluster,
+                    namespace=namespace,
+                    service_name=workload,
+                    cpu_p95_cores=cpu_p95_cores,
+                    mem_p95_mib=mem_p95_mib,
+                )
+            )
+        return metrics
+
+    def _query_prometheus(self, query: str) -> float:
+        """
+        Execute an instant query against Prometheus and return the scalar value.
+        Returns 0.0 when no data is returned or the response is invalid.
+        """
+        with httpx.Client(timeout=self.timeout_seconds) as client:
+            response = client.get(
+                f"{self.prometheus_url}/api/v1/query",
+                params={"query": query},
+            )
+            if response.status_code != 200:
+                return 0.0
+            payload = response.json()
+            if payload.get("status") != "success":
+                return 0.0
+            results = payload.get("data", {}).get("result", [])
+            if not results:
+                return 0.0
+            try:
+                return float(results[0]["value"][1])
+            except (IndexError, KeyError, TypeError, ValueError):
+                return 0.0
 # ==============================================================================

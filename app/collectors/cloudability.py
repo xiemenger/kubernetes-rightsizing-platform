@@ -87,78 +87,78 @@ class MockCloudabilityCollector(BaseCloudabilityCollector):
 #
 # 3. Implement the BaseCloudabilityCollector using Python's `requests` or `httpx`:
 #
-#    import os
-#    import httpx
-#
-#    class ProductionCloudabilityCollector(BaseCloudabilityCollector):
-#        def __init__(self, api_url: str = "https://api.cloudability.com/v3"):
-#            self.api_url = api_url.rstrip("/")
-#            self.api_token = os.environ.get("CLOUDABILITY_API_TOKEN")
-#            if not self.api_token:
-#                raise ValueError("CLOUDABILITY_API_TOKEN environment variable is not set")
-#
-#        def collect_costs(self, services: List[ServiceSpecification]) -> List[ServiceCostInfo]:
-#            cost_infos = []
-#            
-#            headers = {
-#                "Authorization": f"Bearer {self.api_token}",
-#                "Accept": "application/json"
-#            }
-#            
-#            # Build a payload/query params for Cloudability Reporting API
-#            params = {
-#                "metrics": "unblended_cost",
-#                "dimensions": "kubernetes_cluster,kubernetes_namespace,kubernetes_label_app",
-#                "start_date": "7_days_ago",
-#                "end_date": "yesterday"
-#            }
-#            
-#            with httpx.Client() as client:
-#                response = client.get(
-#                    f"{self.api_url}/reporting/cost/metrics",
-#                    headers=headers,
-#                    params=params
-#                )
-#                
-#                if response.status_code != 200:
-#                    # If API query fails, surface the telemetry failure explicitly.
-#                    # Do NOT fabricate fallback estimates or default to 0.0 inside the collector.
-#                    return [
-#                        ServiceCostInfo(s.cluster, s.namespace, s.service_name, None) 
-#                        for s in services
-#                    ]
-#                
-#                raw_data = response.json()
-#                results = raw_data.get("results", [])
-#                
-#                # Map results list to dictionary for O(1) lookup
-#                cost_map = {}
-#                for item in results:
-#                    cluster = item.get("kubernetes_cluster")
-#                    namespace = item.get("kubernetes_namespace")
-#                    svc_name = item.get("kubernetes_label_app")
-#                    cost_val = float(item.get("unblended_cost", 0.0))
-#                    
-#                    cost_map[(cluster, namespace, svc_name)] = cost_val
-#                
-#                for svc in services:
-#                    # Lookup the cost using the mapping key
-#                    lookup_key = (svc.cluster, svc.namespace, svc.service_name)
-#                    weekly_cost = cost_map.get(lookup_key, None)
-#                    
-#                    # Note: We do NOT use fallback formulas like (CPU * cpu_price + Mem * mem_price)
-#                    # inside the cost collector. 0.0 cost represents a free resource, whereas
-#                    # None indicates missing telemetry or tag mismatches. Surfaces None to allow
-#                    # explicit handling in the API/UI as "cost unavailable".
-#                    
-#                    cost_infos.append(
-#                        ServiceCostInfo(
-#                            cluster=svc.cluster,
-#                            namespace=svc.namespace,
-#                            service_name=svc.service_name,
-#                            weekly_cost_usd=round(weekly_cost, 2) if weekly_cost is not None else None
-#                        )
-#                    )
-#                    
-#            return cost_infos
+   import os
+   import httpx
+
+   class ProductionCloudabilityCollector(BaseCloudabilityCollector):
+       def __init__(self, api_url: str = "https://api.cloudability.com/v3"):
+           self.api_url = api_url.rstrip("/")
+           self.api_token = os.environ.get("CLOUDABILITY_API_TOKEN")
+           if not self.api_token:
+               raise ValueError("CLOUDABILITY_API_TOKEN environment variable is not set")
+
+       def collect_costs(self, services: List[ServiceSpecification]) -> List[ServiceCostInfo]:
+           cost_infos = []
+           
+           headers = {
+               "Authorization": f"Bearer {self.api_token}",
+               "Accept": "application/json"
+           }
+           
+           # Build a payload/query params for Cloudability Reporting API
+           params = {
+               "metrics": "unblended_cost",
+               "dimensions": "kubernetes_cluster,kubernetes_namespace,kubernetes_label_app",
+               "start_date": "7_days_ago",
+               "end_date": "yesterday"
+           }
+           
+           with httpx.Client() as client:
+               response = client.get(
+                   f"{self.api_url}/reporting/cost/metrics",
+                   headers=headers,
+                   params=params
+               )
+               
+               if response.status_code != 200:
+                   # If API query fails, surface the telemetry failure explicitly.
+                   # Do NOT fabricate fallback estimates or default to 0.0 inside the collector.
+                   return [
+                       ServiceCostInfo(s.cluster, s.namespace, s.service_name, None) 
+                       for s in services
+                   ]
+               
+               raw_data = response.json()
+               results = raw_data.get("results", [])
+               
+               # Map results list to dictionary for O(1) lookup
+               cost_map = {}
+               for item in results:
+                   cluster = item.get("kubernetes_cluster")
+                   namespace = item.get("kubernetes_namespace")
+                   svc_name = item.get("kubernetes_label_app")
+                   cost_val = float(item.get("unblended_cost", 0.0))
+                   
+                   cost_map[(cluster, namespace, svc_name)] = cost_val
+               
+               for svc in services:
+                   # Lookup the cost using the mapping key
+                   lookup_key = (svc.cluster, svc.namespace, svc.service_name)
+                   weekly_cost = cost_map.get(lookup_key, None)
+                   
+                   # Note: We do NOT use fallback formulas like (CPU * cpu_price + Mem * mem_price)
+                   # inside the cost collector. 0.0 cost represents a free resource, whereas
+                   # None indicates missing telemetry or tag mismatches. Surfaces None to allow
+                   # explicit handling in the API/UI as "cost unavailable".
+                   
+                   cost_infos.append(
+                       ServiceCostInfo(
+                           cluster=svc.cluster,
+                           namespace=svc.namespace,
+                           service_name=svc.service_name,
+                           weekly_cost_usd=round(weekly_cost, 2) if weekly_cost is not None else None
+                       )
+                   )
+                   
+           return cost_infos
 # ==============================================================================

@@ -1,8 +1,11 @@
-# Weekly scheduled rightsizing analysis (production design).
-# Runs every Tuesday morning; creates a Job that executes the same pipeline as
-# app/tasks/pipeline.py (collectors → RightsizerEngine → PostgreSQL).
+# Weekly scheduled rightsizing analysis.
+# The CronJob Pod runs the scheduler entrypoint directly (no HTTP API call).
 #
-# Demo manifest — replace image, secrets, and command with your registry and config.
+# Flow: python -m app.scheduler.cluster_run
+#   → schedule_cluster_rightsizing_run()
+#   → namespace discovery / filter / batch → Celery workers → PostgreSQL
+#
+# Demo manifest — replace image, secrets, and env with your registry and config.
 
 apiVersion: batch/v1
 kind: CronJob
@@ -35,11 +38,18 @@ spec:
               imagePullPolicy: IfNotPresent
               command:
                 - python
-                - -c
-                # Placeholder — production would invoke pipeline entrypoint or Celery task runner
-                - |
-                  print("Run rightsizing pipeline: collectors → engine → persist")
+                - -m
+                - app.scheduler.cluster_run
               env:
+                - name: CLUSTER_NAME
+                  value: "prod-us-east-1"
+                - name: NAMESPACE_BLACKLIST
+                  value: "kube-system"
+                - name: BATCH_SIZE
+                  value: "50"
+                # Optional: comma-separated namespaces to include exclusively
+                # - name: NAMESPACE_WHITELIST
+                #   value: "payments,checkout,catalog"
                 - name: DATABASE_URL
                   valueFrom:
                     secretKeyRef:

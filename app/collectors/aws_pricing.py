@@ -134,95 +134,95 @@ class MockAwsPricingCollector(BaseAwsPricingCollector):
 #
 #    Here is how you would use the `boto3` client to query the AWS Price List API for EC2:
 #
-#    import boto3
-#    import json
-#
-#    class ProductionAwsPricingCollector(BaseAwsPricingCollector):
-#        def __init__(self, node_types: list[NodeType] = None):
-#            self.node_types = node_types or [
-#                NodeType("m5.large", 2, 8.0, 0.096),
-#                NodeType("c5.2xlarge", 8, 16.0, 0.34),
-#                NodeType("m5.2xlarge", 8, 32.0, 0.384),
-#                NodeType("r5.4xlarge", 16, 128.0, 1.008),
-#            ]
-#            # Note: AWS Pricing API endpoint is exclusively in us-east-1
-#            self.pricing_client = boto3.client('pricing', region_name='us-east-1')
-#
-#        def get_pricing(self, region: str) -> AwsResourcePricing:
-#            # 1. Map region code to Region Name string (e.g., 'us-east-1' -> 'US East (N. Virginia)')
-#            region_name_map = {
-#                'us-east-1': 'US East (N. Virginia)',
-#                'us-west-2': 'US West (Oregon)',
-#                'eu-central-1': 'EU (Frankfurt)'
-#            }
-#            full_region_name = region_name_map.get(region, 'US East (N. Virginia)')
-#
-#            fetched_nodes = []
-#            
-#            # Query each node type's price dynamically
-#            for node in self.node_types:
-#                try:
-#                    response = self.pricing_client.get_products(
-#                        ServiceCode='AmazonEC2',
-#                        Filters=[
-#                            {'Type': 'TERM_MATCH', 'Field': 'location', 'Value': full_region_name},
-#                            {'Type': 'TERM_MATCH', 'Field': 'instanceType', 'Value': node.name},
-#                            {'Type': 'TERM_MATCH', 'Field': 'operatingSystem', 'Value': 'Linux'},
-#                            {'Type': 'TERM_MATCH', 'Field': 'tenancy', 'Value': 'Shared'},
-#                            {'Type': 'TERM_MATCH', 'Field': 'preInstalledSw', 'Value': 'NA'},
-#                            {'Type': 'TERM_MATCH', 'Field': 'capacitystatus', 'Value': 'Used'},
-#                        ]
-#                    )
-#                    
-#                    price_per_hour = 0.0
-#                    for price_str in response.get('PriceList', []):
-#                        price_data = json.loads(price_str)
-#                        terms = price_data.get('terms', {}).get('OnDemand', {})
-#                        for term_val in terms.values():
-#                            price_dimensions = term_val.get('priceDimensions', {})
-#                            for dim_val in price_dimensions.values():
-#                                price_per_hour = float(dim_val.get('pricePerUnit', {}).get('USD', 0.0))
-#                                break
-#                    
-#                    # Update the node description with the retrieved price
-#                    fetched_nodes.append(
-#                        NodeType(
-#                            name=node.name,
-#                            vcpu=node.vcpu,
-#                            mem_gib=node.mem_gib,
-#                            price_per_hour=price_per_hour if price_per_hour > 0 else node.price_per_hour
-#                        )
-#                    )
-#                except Exception:
-#                    # Safe fallback to static default if network/API limits are hit
-#                    fetched_nodes.append(node)
-#            
-#            # 2. Sort node types by hourly price
-#            sorted_nodes = sorted(fetched_nodes, key=lambda n: n.price_per_hour)
-#            n = len(sorted_nodes)
-#            
-#            if n == 0:
-#                return AwsResourcePricing(region, 0.0405, 0.00000434)
-#                
-#            if n % 2 == 1:
-#                median_node = sorted_nodes[n // 2]
-#                normalized_price = median_node.price_per_hour
-#                normalized_vcpu = float(median_node.vcpu)
-#                normalized_mem_gib = median_node.mem_gib
-#            else:
-#                node1 = sorted_nodes[(n // 2) - 1]
-#                node2 = sorted_nodes[n // 2]
-#                normalized_price = (node1.price_per_hour + node2.price_per_hour) / 2.0
-#                normalized_vcpu = (node1.vcpu + node2.vcpu) / 2.0
-#                normalized_mem_gib = (node1.mem_gib + node2.mem_gib) / 2.0
-#
-#            # 3. Derive core and MiB hourly costs using a 50/50 allocation model
-#            cpu_cost_per_core_hour = (normalized_price * 0.5) / normalized_vcpu
-#            mem_cost_per_mib_hour = ((normalized_price * 0.5) / normalized_mem_gib) / 1024.0
-#            
-#            return AwsResourcePricing(
-#                region=region,
-#                cpu_cost_per_core_hour=round(cpu_cost_per_core_hour, 6),
-#                mem_cost_per_mib_hour=round(mem_cost_per_mib_hour, 10)
-#            )
+   import boto3
+   import json
+
+   class ProductionAwsPricingCollector(BaseAwsPricingCollector):
+       def __init__(self, node_types: list[NodeType] = None):
+           self.node_types = node_types or [
+               NodeType("m5.large", 2, 8.0, 0.096),
+               NodeType("c5.2xlarge", 8, 16.0, 0.34),
+               NodeType("m5.2xlarge", 8, 32.0, 0.384),
+               NodeType("r5.4xlarge", 16, 128.0, 1.008),
+           ]
+           # Note: AWS Pricing API endpoint is exclusively in us-east-1
+           self.pricing_client = boto3.client('pricing', region_name='us-east-1')
+
+       def get_pricing(self, region: str) -> AwsResourcePricing:
+           # 1. Map region code to Region Name string (e.g., 'us-east-1' -> 'US East (N. Virginia)')
+           region_name_map = {
+               'us-east-1': 'US East (N. Virginia)',
+               'us-west-2': 'US West (Oregon)',
+               'eu-central-1': 'EU (Frankfurt)'
+           }
+           full_region_name = region_name_map.get(region, 'US East (N. Virginia)')
+
+           fetched_nodes = []
+           
+           # Query each node type's price dynamically
+           for node in self.node_types:
+               try:
+                   response = self.pricing_client.get_products(
+                       ServiceCode='AmazonEC2',
+                       Filters=[
+                           {'Type': 'TERM_MATCH', 'Field': 'location', 'Value': full_region_name},
+                           {'Type': 'TERM_MATCH', 'Field': 'instanceType', 'Value': node.name},
+                           {'Type': 'TERM_MATCH', 'Field': 'operatingSystem', 'Value': 'Linux'},
+                           {'Type': 'TERM_MATCH', 'Field': 'tenancy', 'Value': 'Shared'},
+                           {'Type': 'TERM_MATCH', 'Field': 'preInstalledSw', 'Value': 'NA'},
+                           {'Type': 'TERM_MATCH', 'Field': 'capacitystatus', 'Value': 'Used'},
+                       ]
+                   )
+                   
+                   price_per_hour = 0.0
+                   for price_str in response.get('PriceList', []):
+                       price_data = json.loads(price_str)
+                       terms = price_data.get('terms', {}).get('OnDemand', {})
+                       for term_val in terms.values():
+                           price_dimensions = term_val.get('priceDimensions', {})
+                           for dim_val in price_dimensions.values():
+                               price_per_hour = float(dim_val.get('pricePerUnit', {}).get('USD', 0.0))
+                               break
+                   
+                   # Update the node description with the retrieved price
+                   fetched_nodes.append(
+                       NodeType(
+                           name=node.name,
+                           vcpu=node.vcpu,
+                           mem_gib=node.mem_gib,
+                           price_per_hour=price_per_hour if price_per_hour > 0 else node.price_per_hour
+                       )
+                   )
+               except Exception:
+                   # Safe fallback to static default if network/API limits are hit
+                   fetched_nodes.append(node)
+           
+           # 2. Sort node types by hourly price
+           sorted_nodes = sorted(fetched_nodes, key=lambda n: n.price_per_hour)
+           n = len(sorted_nodes)
+           
+           if n == 0:
+               return AwsResourcePricing(region, 0.0405, 0.00000434)
+               
+           if n % 2 == 1:
+               median_node = sorted_nodes[n // 2]
+               normalized_price = median_node.price_per_hour
+               normalized_vcpu = float(median_node.vcpu)
+               normalized_mem_gib = median_node.mem_gib
+           else:
+               node1 = sorted_nodes[(n // 2) - 1]
+               node2 = sorted_nodes[n // 2]
+               normalized_price = (node1.price_per_hour + node2.price_per_hour) / 2.0
+               normalized_vcpu = (node1.vcpu + node2.vcpu) / 2.0
+               normalized_mem_gib = (node1.mem_gib + node2.mem_gib) / 2.0
+
+           # 3. Derive core and MiB hourly costs using a 50/50 allocation model
+           cpu_cost_per_core_hour = (normalized_price * 0.5) / normalized_vcpu
+           mem_cost_per_mib_hour = ((normalized_price * 0.5) / normalized_mem_gib) / 1024.0
+           
+           return AwsResourcePricing(
+               region=region,
+               cpu_cost_per_core_hour=round(cpu_cost_per_core_hour, 6),
+               mem_cost_per_mib_hour=round(mem_cost_per_mib_hour, 10)
+           )
 # ==============================================================================
